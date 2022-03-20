@@ -1,0 +1,7 @@
+{
+    "settings": {
+      "title": "Tech Controllers app config",
+      "subtitle": "Please provide your https://emodul.eu username and password.",
+      "cache-desc": "This is the minimum delay between subsequent eModul API calls to fetch zone data."
+    }
+  }
