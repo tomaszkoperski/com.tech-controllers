@@ -1,0 +1,29 @@
+{
+  "id": "com.tech-controllers",
+  "version": "1.0.0",
+  "compatibility": ">=5.0.0",
+  "sdk": 3,
+  "brandColor": "#00A0E3",
+  "platforms": [
+    "local"
+  ],
+  "name": {
+    "en": "Tech Controllers"
+  },
+  "description": {
+    "en": "Add support for Tech controllers."
+  },
+  "category": [
+    "climate"
+  ],
+  "permissions": [],
+  "images": {
+    "small": "/assets/images/small.png",
+    "large": "/assets/images/large.png",
+    "xlarge": "/assets/images/xlarge.png"
+  },
+  "author": {
+    "name": "Tomasz Koperski",
+    "email": "tomasz.koperski@gmail.com"
+  }
+}
