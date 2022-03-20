@@ -5,6 +5,11 @@
   "compatibility": ">=5.0.0",
   "sdk": 3,
   "brandColor": "#00A0E3",
+  "bugs": {
+    "url": "https://github.com/tomaszkoperski/com.tech-controllers/issues"
+  },
+  "homeyCommunityTopicId": 61870,
+  "source": "https://github.com/tomaszkoperski/com.tech-controllers",
   "platforms": [
     "local"
   ],
@@ -25,7 +30,7 @@
   },
   "author": {
     "name": "Tomasz Koperski",
-    "email": "tomasz.koperski@gmail.com"
+    "email": "tomasz@koper.ski"
   },
   "drivers": [
     {
