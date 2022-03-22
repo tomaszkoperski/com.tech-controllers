@@ -1,6 +1,6 @@
 {
   "id": "com.tech-controllers",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "compatibility": ">=5.0.0",
   "sdk": 3,
   "brandColor": "#00A0E3",
@@ -13,10 +13,10 @@
     "local"
   ],
   "name": {
-    "en": "Tech Controllers"
+    "en": "TECH Controllers"
   },
   "description": {
-    "en": "Add support for Tech controllers."
+    "en": "Energy-saving solutions at home"
   },
   "category": [
     "climate"
