@@ -1,10 +1,10 @@
 'use strict';
 
 const {
-  throws
+  throws,
 } = require('assert');
 const {
-  Device
+  Device,
 } = require('homey');
 
 class Zone extends Device {
@@ -29,14 +29,14 @@ class Zone extends Device {
     this.module_udid = this.getData().module_udid;
     this.log(`module_udid: ${this.module_udid}`);
 
-    this.registerCapabilityListener('target_temperature', async (value) => {
-      //set temp
+    this.registerCapabilityListener('target_temperature', async value => {
+      // set temperature
       this.log('Setting temperature to:', value);
       this.homey.app.setZone({
         module_udid: this.module_udid,
         mode_id: this.mode_id,
         mode_parent_id: this.zone_id,
-        target_temperature: value
+        target_temperature: value,
       });
     });
 
@@ -61,7 +61,7 @@ class Zone extends Device {
   async onSettings({
     oldSettings,
     newSettings,
-    changedKeys
+    changedKeys,
   }) {
     this.log('Zone settings where changed');
     await this.__updateDevice();
@@ -105,6 +105,7 @@ class Zone extends Device {
       this.log(`setCapabilityValueLog error ${capability} ${err.message}`);
     }
   }
+
 }
 
 module.exports = Zone;

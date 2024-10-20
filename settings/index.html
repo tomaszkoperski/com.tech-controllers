@@ -41,6 +41,8 @@
 
     <button id="save" class="right">Save changes</button>
 
+    <p id="saveMessage" style="display: none; color: green;">Changes saved successfully!</p>
+
     <script type="text/javascript">
       // a method named 'onHomeyReady' must be present in your code
       function onHomeyReady(Homey) {
@@ -51,6 +53,7 @@
         var passwordElement = document.getElementById("password");
         var cachettlElement = document.getElementById("cachettl");
         var saveElement = document.getElementById("save");
+        var saveMessageElement = document.getElementById("saveMessage");
 
         Homey.get("username", function (err, username) {
           if (err) return Homey.alert(err);
@@ -77,6 +80,12 @@
           Homey.set("cachettl", cachettlElement.value, function (err) {
             if (err) return Homey.alert(err);
           });
+
+          // Show success message
+          saveMessageElement.style.display = "block";
+          setTimeout(function() {
+            saveMessageElement.style.display = "none";
+          }, 3000); // Hide message after 3 seconds
         });
       }
     </script>

@@ -1,11 +1,11 @@
 'use strict';
 
 const {
-  throws
+  throws,
 } = require('assert');
 const Homey = require('homey');
 const fetch = require('node-fetch');
-const cache = require('node-cache');
+const Cache = require('node-cache');
 
 class TechApp extends Homey.App {
 
@@ -31,12 +31,12 @@ class TechApp extends Homey.App {
       this.pollInterval = 60;
     }
 
-    this.cache = new cache({
-      stdTTL: this.cachettl
+    this.cache = new Cache({
+      stdTTL: this.cachettl,
     });
 
     this.homey.settings.on('set', async key => {
-      this.log('App settings updated...')
+      this.log('App settings updated...');
       this.username = this.homey.settings.get('username');
       this.password = this.homey.settings.get('password');
       this.cachettl = this.homey.settings.get('cachettl');
@@ -48,6 +48,9 @@ class TechApp extends Homey.App {
     // Let's make sure we have a fresh token.
     await this.refreshToken();
 
+    // Wait for devices to be ready
+    await this.waitForDevicesReady();
+
     // Get zone data into cache, so when individual devices are refreshing we won't spam the API with requests.
     await this.getZones();
 
@@ -58,10 +61,10 @@ class TechApp extends Homey.App {
   }
 
   async getZones() {
-    let cached_zones = this.cache.get("Zones");
-    if (cached_zones !== undefined) {
-      this.log("Zone data is served from cache...")
-      return cached_zones;
+    const cachedZones = this.cache.get('Zones');
+    if (cachedZones !== undefined) {
+      this.log('Zone data is served from cache...');
+      return cachedZones;
     }
 
     try {
@@ -69,49 +72,49 @@ class TechApp extends Homey.App {
 
       const modules = await this._call({
         method: 'get',
-        path: `/users/${this.user_id}/modules`
+        path: `/users/${this.user_id}/modules`,
       });
 
-      let all_zones = [];
+      const allZones = [];
 
       for (const module of modules) {
         this.log(`Got module ${module.udid}. Scanning for zones...`);
 
         const response = await this._call({
           method: 'get',
-          path: `/users/${this.user_id}/modules/${module.udid}`
+          path: `/users/${this.user_id}/modules/${module.udid}`,
         });
 
         const zones = response.zones.elements;
 
         for (const zone of zones) {
-          // TODO: list only enabled zones
           if (zone && zone.zone.zoneState !== 'zoneOff') {
             zone.module_udid = module.udid;
-            all_zones.push(zone);
+            allZones.push(zone);
+            // this.log(`Got zone data from API: ${JSON.stringify(zone)}`);
           }
         }
       }
 
-      this.cache.set("Zones", all_zones);
+      this.cache.set('Zones', allZones);
+      // this.log(`Got zone data from API: ${JSON.stringify(allZones)}`);
 
-      return all_zones;
+      return allZones;
     } catch (err) {
       this.log(`Got error when scanning for zones: ${err.message}`);
       return null;
     }
-
   }
 
   async onPoll() {
     this.timerProcessing = true;
-    this.log("!!! Polling started...");
+    this.log('!!! Polling started...');
     const promises = [];
 
     try {
       const drivers = this.homey.drivers.getDrivers();
-      for (const driver in drivers) {
-        let devices = this.homey.drivers.getDriver(driver).getDevices();
+      for (const driver of Object.values(drivers)) {
+        const devices = driver.getDevices();
         for (const device of devices) {
           if (device.__updateDevice) {
             promises.push(device.__updateDevice());
@@ -119,82 +122,122 @@ class TechApp extends Homey.App {
         }
       }
       await Promise.all(promises);
-      this.log("!!! Polling ended.");
+      this.log('!!! Polling ended.');
     } catch (err) {
-      this.log(`Polling error: ${err.message}`)
+      this.log(`Polling error: ${err.message}`);
     }
 
-    var nextPoll = Number(this.pollInterval * 1000);
+    const nextPoll = Number(this.pollInterval * 1000);
     this.log(`Next poll in ${this.pollInterval} seconds`);
     this.timerID = this.homey.setTimeout(this.onPoll, nextPoll);
     this.timerProcessing = false;
   }
 
-
   async setZone({
-    module_udid,
-    mode_id,
-    mode_parent_id,
-    target_temperature
+    moduleUdid,
+    modeId,
+    modeParentId,
+    targetTemperature,
   }) {
     try {
-      let success = this._call({
+      const success = await this._call({
         method: 'post',
-        path: `/users/${this.user_id}/modules/${module_udid}/zones`,
+        path: `/users/${this.user_id}/modules/${moduleUdid}/zones`,
         json: {
           mode: {
-            id: mode_id,
-            parentId: mode_parent_id,
-            mode: "constantTemp",
+            id: modeId,
+            parentId: modeParentId,
+            mode: 'constantTemp',
             constTempTime: 0,
-            setTemperature: target_temperature * 10,
-            scheduleIndex: 0
-          }
-        }
-      })
-      this.cache.del("Zones");
+            setTemperature: targetTemperature * 10,
+            scheduleIndex: 0,
+          },
+        },
+      });
+      this.cache.del('Zones');
+      return success;
     } catch (err) {
       this.log(`Got error when modifying zone: ${err.message}`);
       return null;
     }
   }
 
+  async waitForDevicesReady() {
+    this.log('Waiting for drivers and devices to be ready...');
+    const maxRetries = 10;
+    let retryCount = 0;
+    let allReady = false;
+
+    while (!allReady && retryCount < maxRetries) {
+      allReady = true;
+      const drivers = this.homey.drivers.getDrivers();
+      const readinessPromises = [];
+
+      for (const driver of Object.values(drivers)) {
+        readinessPromises.push(driver.read());
+
+        const devices = driver.getDevices();
+        for (const device of devices) {
+          readinessPromises.push(device.ready());
+        }
+      }
+
+      try {
+        await Promise.all(readinessPromises);
+      } catch (err) {
+        this.log(`Error waiting for drivers or devices: ${err.message}`);
+        allReady = false;
+      }
+
+      if (!allReady) {
+        this.log(`Drivers or devices not ready, retrying... (${retryCount + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds before retrying
+        retryCount++;
+      }
+    }
+
+    if (!allReady) {
+      this.log('Warning: Some drivers or devices may not be ready.');
+    } else {
+      this.log('All drivers and devices are ready.');
+    }
+  }
+
   async refreshToken() {
     try {
       this.log('Refreshing eModul API token and user_id');
-      await this._call({
+      const response = await this._call({
         method: 'post',
         path: '/authentication',
         json: {
           username: this.username,
-          password: this.password
-        }
-      }).then(response => {
-        this.token = response.token
-        this.user_id = response.user_id
-        this.log(`Got token: ${this.token}, user_id: ${this.user_id}`);
+          password: this.password,
+        },
       });
+
+      this.token = response.token;
+      this.user_id = response.user_id;
+      this.log(`Got token! user_id: ${this.user_id}`);
+      return true;
     } catch (err) {
       this.log(`Got error while refreshing token: ${err.message}`);
-      return null;
+      return false;
     }
   }
 
   /*
    * API helper
    */
-
   async _call({
     method = 'get',
     path = '/',
     body,
-    json
+    json,
   }) {
-
     const url = `https://emodul.eu/api/v1${path}`;
     const opts = {
       method,
-      headers: {}
+      headers: {},
     };
 
     if (this.token) {
@@ -217,20 +260,27 @@ class TechApp extends Homey.App {
       err.code = res.status;
       this.log(err);
       let authRetryCount = 1;
+      let backoffDelay = 10000;
+
       while (res.status === 401 && authRetryCount <= 5) {
-        this.log(`Trying to authorize again... ${authRetryCount}/5`)
+        this.log(`Trying to authorize again... ${authRetryCount}/5, backoff delay: ${backoffDelay * 1000}s`);
         authRetryCount++;
         this.token = '';
         await this.refreshToken();
-        let res = await fetch(url, opts);
+
+        await this.delay(backoffDelay); // Użycie metody delay
+        backoffDelay *= 2;
+
+        res = await fetch(url, opts);
       }
     }
 
     const resJson = await res.json();
-    //this.log(url, opts);
-    //this.log(resJson);
-
     return resJson;
+  }
+
+  delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
 }

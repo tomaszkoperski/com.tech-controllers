@@ -26,14 +26,11 @@ class Zone extends Driver {
           zone_id: element.zone.id,
           zone_parent_id: element.zone.parentId,
           mode_id: element.mode.id,
-          module_udid: element.module_udid
-        }
-      }
+          module_udid: element.module_udid,
+        },
+      };
     });
-
   }
-
-
 
 }
 
