@@ -86,7 +86,7 @@ class TechApp extends Homey.App {
 
         for (const zone of zones) {
           // TODO: list only enabled zones
-          if (zone.zone.zoneState !== "zoneOff" && true) {
+          if (zone && zone.zone.zoneState !== 'zoneOff') {
             zone.module_udid = module.udid;
             all_zones.push(zone);
           }
