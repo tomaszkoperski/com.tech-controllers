@@ -134,22 +134,22 @@ class TechApp extends Homey.App {
   }
 
   async setZone({
-    moduleUdid,
-    modeId,
-    modeParentId,
-    targetTemperature,
+    module_udid,
+    mode_id,
+    mode_parent_id,
+    target_temperature,
   }) {
     try {
       const success = await this._call({
         method: 'post',
-        path: `/users/${this.user_id}/modules/${moduleUdid}/zones`,
+        path: `/users/${this.user_id}/modules/${module_udid}/zones`,
         json: {
           mode: {
-            id: modeId,
-            parentId: modeParentId,
+            id: mode_id,
+            parentId: mode_parent_id,
             mode: 'constantTemp',
             constTempTime: 0,
-            setTemperature: targetTemperature * 10,
+            setTemperature: target_temperature * 10,
             scheduleIndex: 0,
           },
         },
@@ -191,7 +191,7 @@ class TechApp extends Homey.App {
 
       if (!allReady) {
         this.log(`Drivers or devices not ready, retrying... (${retryCount + 1}/${maxRetries})`);
-        await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds before retrying
+        await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds before retrying
         retryCount++;
       }
     }
@@ -225,18 +225,19 @@ class TechApp extends Homey.App {
     }
   }
 
-  /*
-   * API helper
+  /**
+   * API helper method to make HTTP requests with retry and backoff logic.
+   * @param {Object} params - The request parameters.
+   * @param {string} params.method - HTTP method (e.g., 'get', 'post').
+   * @param {string} params.path - API endpoint path.
+   * @param {Object} [params.body] - Request body as a string.
+   * @param {Object} [params.json] - Request body as a JSON object.
+   * @returns {Object} - The JSON response from the API.
    */
-  async _call({
-    method = 'get',
-    path = '/',
-    body,
-    json,
-  }) {
+  async _call({ method = 'get', path = '/', body, json }) {
     const url = `https://emodul.eu/api/v1${path}`;
     const opts = {
-      method,
+      method: method.toUpperCase(),
       headers: {},
     };
 
@@ -250,35 +251,79 @@ class TechApp extends Homey.App {
 
     if (json) {
       opts.body = JSON.stringify(json);
-      opts.headers['Content-type'] = 'application/json';
+      opts.headers['Content-Type'] = 'application/json';
     }
 
-    let res = await fetch(url, opts);
+    // this.log(`API URL: ${url}`);
+    // this.log(`API request: ${JSON.stringify(opts)}`);
 
-    if (!res.ok) {
-      const err = new Error(`API error occured: response status is ${res.status}`);
-      err.code = res.status;
-      this.log(err);
-      let authRetryCount = 1;
-      let backoffDelay = 10000;
+    const maxRetries = 5;
+    let attempt = 0;
+    let backoffDelay = 10000; // Start with 10 seconds
 
-      while (res.status === 401 && authRetryCount <= 5) {
-        this.log(`Trying to authorize again... ${authRetryCount}/5, backoff delay: ${backoffDelay * 1000}s`);
-        authRetryCount++;
-        this.token = '';
-        await this.refreshToken();
+    while (attempt <= maxRetries) {
+      try {
+        const res = await fetch(url, opts);
 
-        await this.delay(backoffDelay); // Użycie metody delay
-        backoffDelay *= 2;
+        if (res.ok) {
+          const resJson = await res.json();
+          return resJson;
+        }
 
-        res = await fetch(url, opts);
+        const err = new Error(`API error occurred: response status is ${res.status}`);
+        err.code = res.status;
+        this.log(err);
+
+        if (res.status === 401 || res.status === 403) {
+          if (attempt === maxRetries) {
+            throw new Error('Max retries reached. Authorization failed.');
+          }
+
+          this.log(`Attempting to refresh token... (${attempt + 1}/${maxRetries})`);
+          this.token = '';
+          const refreshed = await this.refreshToken();
+
+          if (!refreshed) {
+            throw new Error('Failed to refresh token.');
+          }
+
+          // Update the Authorization header with the new token
+          opts.headers['Authorization'] = `Bearer ${this.token}`;
+
+          // Wait before retrying
+          await this.delay(backoffDelay);
+          backoffDelay *= 2; // Exponential backoff
+          attempt++;
+          continue;
+        } else if (res.status >= 500 && res.status < 600) {
+          // Server errors, retry
+          if (attempt === maxRetries) {
+            throw new Error(`Max retries reached. Server error: ${res.status}`);
+          }
+
+          this.log(`Server error encountered. Retrying indefinitely. Next retry in ${backoffDelay / 1000} seconds... (${attempt + 1}/${maxRetries})`);
+          await this.delay(backoffDelay);
+          backoffDelay *= 2; // Exponential backoff
+          continue;
+        } else {
+          // Other errors, do not retry
+          throw err;
+        }
+      } catch (err) {
+        this.log(`Error during API call: ${err.message}`);
+        if (attempt === maxRetries) {
+          throw err;
+        }
+        attempt++;
       }
     }
-
-    const resJson = await res.json();
-    return resJson;
   }
 
+  /**
+   * Delay helper method.
+   * @param {number} ms - Milliseconds to delay.
+   * @returns {Promise} - Resolves after the specified delay.
+   */
   delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
