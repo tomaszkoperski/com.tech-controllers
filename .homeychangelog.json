@@ -10,5 +10,8 @@
   },
   "1.0.3": {
     "en": "Fixed handling of empty zones"
+  },
+  "1.1.0": {
+    "en": "Code cleanup, added confirmation message in settings, added checks to see if driver and devices are ready before polling data"
   }
 }
