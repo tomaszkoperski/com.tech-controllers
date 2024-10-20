@@ -28,7 +28,7 @@ See the [Issue Tracker](https://github.com/tomaszkoperski/com.tech-controllers/i
 ## Change Log
 * **1.0.0** Initial release (2022-03-20).
 * **1.0.3** Fixed handling of empty zones (2024-10-20).
-* **1.1.0** Code cleanup, confirmation message in settings, check driver and devices readiness on startup (2024-10-20).
+* **1.1.1** Code cleanup, confirmation message in settings, check driver and devices readiness on startup (2024-10-20).
 
 ## Feedback
 Please report issues in the [issues section on GitHub](https://github.com/tomaszkoperski/com.tech-controllers/issues).

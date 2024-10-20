@@ -1,6 +1,6 @@
 {
   "id": "com.tech-controllers",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "compatibility": ">=5.0.0",
   "sdk": 3,
   "brandColor": "#00A0E3",
@@ -33,7 +33,9 @@
   },
   "contributing": {
     "donate": {
-      "paypal": "kpr31337"
+      "paypal": {
+        "username": "kpr31337"
+      }
     }
   }
 }

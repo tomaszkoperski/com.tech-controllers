@@ -13,5 +13,8 @@
   },
   "1.1.0": {
     "en": "Code cleanup, added confirmation message in settings, added checks to see if driver and devices are ready before polling data"
+  },
+  "1.1.1": {
+    "en": "Code cleanup, added confirmation message in settings, added checks to see if driver and devices are ready before polling data"
   }
 }
