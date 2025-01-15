@@ -19,5 +19,8 @@
   },
   "1.1.2": {
     "en": "Code cleanup, added confirmation message in settings, added checks to see if driver and devices are ready before polling data"
+  },
+  "1.2.0": {
+    "en": "Improved handling of changing measurement and temperature settings. Preventing random data owerwrites from race conditions with API (changes done outside of Homey). Other small fixes."
   }
 }

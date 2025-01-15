@@ -32,7 +32,7 @@ class Zone extends Device {
     this.registerCapabilityListener('target_temperature', async value => {
       // set temperature
       this.log(`Setting temperature in zone ${this.getName()} to: ${value}`);
-      this.homey.app.setZone({
+      await this.homey.app.setZone({
         module_udid: this.module_udid,
         mode_id: this.mode_id,
         mode_parent_id: this.zone_id,
@@ -85,13 +85,12 @@ class Zone extends Device {
   }
 
   async __updateDevice() {
-    this.log('Updating device...');
     try {
       const zones = await this.homey.app.getZones();
       const zone = zones.find(zone => (zone.zone.id === this.zone_id && zone.module_udid === this.module_udid));
-      this.setCapabilityValueLog('target_temperature', zone.zone.setTemperature / 10);
-      this.setCapabilityValueLog('measure_temperature', zone.zone.currentTemperature / 10);
-      this.setCapabilityValueLog('measure_battery', zone.zone.batteryLevel);
+      this.setCapabilityValueLogIfChanged('target_temperature', zone.zone.setTemperature / 10);
+      this.setCapabilityValueLogIfChanged('measure_temperature', zone.zone.currentTemperature / 10);
+      this.setCapabilityValueLogIfChanged('measure_battery', zone.zone.batteryLevel);
     } catch (err) {
       this.log(`Error in __updateDevice: ${err.message}`);
     }
@@ -103,6 +102,18 @@ class Zone extends Device {
       await this.setCapabilityValue(capability, value);
     } catch (err) {
       this.log(`setCapabilityValueLog error ${capability} ${err.message}`);
+    }
+  }
+
+  async setCapabilityValueLogIfChanged(capability, value) {
+    const currentValue = await this.getCapabilityValue(capability);
+    if (currentValue !== value) {
+      this.log(`setCapability in ${this.getName()}: ${capability}: ${value} (was: ${currentValue})`);
+      try {
+        await this.setCapabilityValue(capability, value);
+      } catch (err) {
+        this.log(`setCapabilityValueLog error ${capability} ${err.message}`);
+      }
     }
   }
 

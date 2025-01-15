@@ -17,18 +17,18 @@ class TechApp extends Homey.App {
 
     this.username = this.homey.settings.get('username');
     this.password = this.homey.settings.get('password');
-    this.cachettl = this.homey.settings.get('cachettl');
-    this.pollInterval = this.homey.settings.get('cachettl');
+    this.cachettl = Number(this.homey.settings.get('cachettl'));
+    this.pollInterval = Number(this.homey.settings.get('cachettl')) + 1;
 
     if (typeof this.username === 'undefined') {
       this.log('eModul credentials are missing!');
       return;
     }
 
-    if (this.cachettl < 60 || this.pollInterval < 60) {
+    if (this.cachettl < 60 || this.pollInterval < 61) {
       this.homey.settings.set('cachettl', 60);
       this.cachettl = 60;
-      this.pollInterval = 60;
+      this.pollInterval = 61;
     }
 
     this.cache = new Cache({
@@ -39,7 +39,7 @@ class TechApp extends Homey.App {
       this.log('App settings updated...');
       this.username = this.homey.settings.get('username');
       this.password = this.homey.settings.get('password');
-      this.cachettl = this.homey.settings.get('cachettl');
+      this.cachettl = Number(this.homey.settings.get('cachettl'));
       this.cache.stdTTL = this.cachettl;
       await this.refreshToken();
       await this.getZones();
@@ -55,7 +55,7 @@ class TechApp extends Homey.App {
     await this.getZones();
 
     this.onPoll = this.onPoll.bind(this);
-    this.timerID = this.homey.setTimeout(this.onPoll, 15000);
+    this.timerID = this.homey.setTimeout(this.onPoll, 10000);
 
     this.log('App finished init');
   }
@@ -63,13 +63,10 @@ class TechApp extends Homey.App {
   async getZones() {
     const cachedZones = this.cache.get('Zones');
     if (cachedZones !== undefined) {
-      this.log('Zone data is served from cache...');
       return cachedZones;
     }
 
     try {
-      this.log('Getting all modules...');
-
       const modules = await this._call({
         method: 'get',
         path: `/users/${this.user_id}/modules`,
@@ -78,7 +75,7 @@ class TechApp extends Homey.App {
       const allZones = [];
 
       for (const module of modules) {
-        this.log(`Got module ${module.udid}. Scanning for zones...`);
+        this.log(`Got module ${module.udid} (${module.name}). Scanning for zone changes...`);
 
         const response = await this._call({
           method: 'get',
@@ -89,9 +86,27 @@ class TechApp extends Homey.App {
 
         for (const zone of zones) {
           if (zone && zone.zone.zoneState !== 'zoneOff') {
-            zone.module_udid = module.udid;
-            allZones.push(zone);
-            // this.log(`Got zone data from API: ${JSON.stringify(zone)}`);
+            // Skip updating cache if zone is currently changing
+            if (!zone.zone.duringChange) {
+              zone.module_udid = module.udid;
+              allZones.push(zone);
+              // this.log(`Got zone data from API: ${JSON.stringify(zone.zone)}`);
+            } else {
+              // If zone is changing, use cached data if available
+              const cachedZone = cachedZones?.find(
+                cached => cached.zone.id === zone.zone.id && 
+                         cached.module_udid === module.udid
+              );
+              if (cachedZone) {
+                allZones.push(cachedZone);
+                this.log(`Using cached data for changing zone: ${zone.zone.id}`);
+              } else {
+                // If no cached data available, use current (API) data
+                zone.module_udid = module.udid;
+                allZones.push(zone);
+                this.log(`No cached data for changing zone: ${zone.zone.id}`);
+              }
+            }
           }
         }
       }
@@ -117,7 +132,7 @@ class TechApp extends Homey.App {
         const devices = driver.getDevices();
         for (const device of devices) {
           if (device.__updateDevice) {
-            promises.push(device.__updateDevice());
+            promises.push(await device.__updateDevice());
           }
         }
       }
@@ -140,6 +155,20 @@ class TechApp extends Homey.App {
     target_temperature,
   }) {
     try {
+      // Update the cached zone's target temperature
+      const cachedZones = this.cache.get('Zones');
+      if (cachedZones) {
+        const zoneToUpdate = cachedZones.find(
+          zone => zone.module_udid === module_udid && zone.zone.id === mode_parent_id
+        );
+        if (zoneToUpdate) {
+          zoneToUpdate.zone.setTemperature = target_temperature * 10;
+          zoneToUpdate.mode.setTemperature = target_temperature * 10;
+          this.cache.set('Zones', cachedZones);
+          this.log(`Updated cached temperature for zone ${mode_parent_id} (${zoneToUpdate.description.name}) to ${target_temperature}`);
+        }
+      }
+
       const success = await this._call({
         method: 'post',
         path: `/users/${this.user_id}/modules/${module_udid}/zones`,
@@ -154,7 +183,8 @@ class TechApp extends Homey.App {
           },
         },
       });
-      this.cache.del('Zones');
+      await this.delay(5000);
+      await this.getZones();
       return success;
     } catch (err) {
       this.log(`Got error when modifying zone: ${err.message}`);
