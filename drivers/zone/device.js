@@ -1,9 +1,6 @@
 'use strict';
 
 const {
-  throws,
-} = require('assert');
-const {
   Device,
 } = require('homey');
 
@@ -28,6 +25,10 @@ class Zone extends Device {
 
     this.module_udid = this.getData().module_udid;
     this.log(`module_udid: ${this.module_udid}`);
+
+    // Track consecutive failures for availability management
+    this._failureCount = 0;
+    this._maxFailures = 3;
 
     this.registerCapabilityListener('target_temperature', async value => {
       // set temperature
@@ -87,12 +88,38 @@ class Zone extends Device {
   async __updateDevice() {
     try {
       const zones = await this.homey.app.getZones();
-      const zone = zones.find(zone => (zone.zone.id === this.zone_id && zone.module_udid === this.module_udid));
+
+      // Handle null response (API error case)
+      if (!zones) {
+        throw new Error('API returned null - zones unavailable');
+      }
+
+      const zone = zones.find(z => z.zone.id === this.zone_id && z.module_udid === this.module_udid);
+
+      // Handle zone not found
+      if (!zone) {
+        throw new Error(`Zone ${this.zone_id} not found in API response`);
+      }
+
+      // Success - reset failure count and ensure device is available
+      this._failureCount = 0;
+      if (!this.getAvailable()) {
+        await this.setAvailable();
+        this.log('Device is now available again');
+      }
+
       this.setCapabilityValueLogIfChanged('target_temperature', zone.zone.setTemperature / 10);
       this.setCapabilityValueLogIfChanged('measure_temperature', zone.zone.currentTemperature / 10);
       this.setCapabilityValueLogIfChanged('measure_battery', zone.zone.batteryLevel);
     } catch (err) {
-      this.log(`Error in __updateDevice: ${err.message}`);
+      this._failureCount++;
+      this.error(`Error in __updateDevice (attempt ${this._failureCount}/${this._maxFailures}): ${err.message}`);
+
+      // Mark device unavailable after consecutive failures
+      if (this._failureCount >= this._maxFailures && this.getAvailable()) {
+        await this.setUnavailable('Connection lost - retrying...');
+        this.error('Device marked as unavailable due to repeated failures');
+      }
     }
   }
 
