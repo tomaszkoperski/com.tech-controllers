@@ -155,13 +155,17 @@ class TechApp extends Homey.App {
     target_temperature,
   }) {
     try {
-      // Update the cached zone's target temperature
       const cachedZones = this.cache.get('Zones');
+      let currentScheduleIndex = 0;
+
       if (cachedZones) {
         const zoneToUpdate = cachedZones.find(
           zone => zone.module_udid === module_udid && zone.zone.id === mode_parent_id
         );
         if (zoneToUpdate) {
+          if (typeof zoneToUpdate.mode.scheduleIndex !== 'undefined') {
+            currentScheduleIndex = zoneToUpdate.mode.scheduleIndex;
+          }
           zoneToUpdate.zone.setTemperature = target_temperature * 10;
           zoneToUpdate.mode.setTemperature = target_temperature * 10;
           this.cache.set('Zones', cachedZones);
@@ -179,7 +183,7 @@ class TechApp extends Homey.App {
             mode: 'constantTemp',
             constTempTime: 0,
             setTemperature: target_temperature * 10,
-            scheduleIndex: 0,
+            scheduleIndex: currentScheduleIndex,
           },
         },
       });
