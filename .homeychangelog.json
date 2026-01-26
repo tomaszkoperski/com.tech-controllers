@@ -22,5 +22,11 @@
   },
   "1.2.0": {
     "en": "Improved handling of changing measurement and temperature settings. Preventing random data owerwrites from race conditions with API (changes done outside of Homey). Other small fixes."
+  },
+  "1.2.1": {
+    "en": "Fixed an issue where setting the temperature would change the active schedule"
+  },
+  "1.2.2": {
+    "en": "Fixed API synchronization issues"
   }
 }
