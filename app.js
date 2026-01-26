@@ -35,6 +35,11 @@ class TechApp extends Homey.App {
       stdTTL: this.cachettl,
     });
 
+    // Mutex for preventing race conditions between setZone and polling
+    this._isWriting = false;
+    this._writeQueue = [];
+    this._lastZonesData = null; // Backup of last known zones data for duringChange fallback
+
     this.homey.settings.on('set', async key => {
       this.log('App settings updated...');
       this.username = this.homey.settings.get('username');
@@ -42,7 +47,7 @@ class TechApp extends Homey.App {
       this.cachettl = Number(this.homey.settings.get('cachettl'));
       this.cache.stdTTL = this.cachettl;
       await this.refreshToken();
-      await this.getZones();
+      await this.getZones(true); // Force refresh
     });
 
     // Let's make sure we have a fresh token.
@@ -52,7 +57,7 @@ class TechApp extends Homey.App {
     await this.waitForDevicesReady();
 
     // Get zone data into cache, so when individual devices are refreshing we won't spam the API with requests.
-    await this.getZones();
+    await this.getZones(true); // Force initial fetch
 
     this.onPoll = this.onPoll.bind(this);
     this.timerID = this.homey.setTimeout(this.onPoll, 10000);
@@ -60,9 +65,23 @@ class TechApp extends Homey.App {
     this.log('App finished init');
   }
 
-  async getZones() {
+  async getZones(forceRefresh = false) {
+    // If a write operation is in progress, return cached data to avoid race conditions
+    if (this._isWriting && !forceRefresh) {
+      const cachedZones = this.cache.get('Zones');
+      if (cachedZones) {
+        this.log('Write in progress, returning cached zones');
+        return cachedZones;
+      }
+      // If no cache but write in progress, return last known data
+      if (this._lastZonesData) {
+        this.log('Write in progress, no cache, returning last known zones');
+        return this._lastZonesData;
+      }
+    }
+
     const cachedZones = this.cache.get('Zones');
-    if (cachedZones !== undefined) {
+    if (cachedZones !== undefined && !forceRefresh) {
       return cachedZones;
     }
 
@@ -73,6 +92,8 @@ class TechApp extends Homey.App {
       });
 
       const allZones = [];
+      // Use last known data for duringChange fallback (not current cache which might be empty)
+      const fallbackZones = this._lastZonesData || cachedZones;
 
       for (const module of modules) {
         this.log(`Got module ${module.udid} (${module.name}). Scanning for zone changes...`);
@@ -90,21 +111,20 @@ class TechApp extends Homey.App {
             if (!zone.zone.duringChange) {
               zone.module_udid = module.udid;
               allZones.push(zone);
-              // this.log(`Got zone data from API: ${JSON.stringify(zone.zone)}`);
             } else {
-              // If zone is changing, use cached data if available
-              const cachedZone = cachedZones?.find(
+              // If zone is changing, use fallback data if available
+              const fallbackZone = fallbackZones?.find(
                 cached => cached.zone.id === zone.zone.id && 
                          cached.module_udid === module.udid
               );
-              if (cachedZone) {
-                allZones.push(cachedZone);
-                this.log(`Using cached data for changing zone: ${zone.zone.id}`);
+              if (fallbackZone) {
+                allZones.push(fallbackZone);
+                this.log(`Using fallback data for changing zone: ${zone.zone.id}`);
               } else {
-                // If no cached data available, use current (API) data
+                // If no fallback data available, use current (API) data
                 zone.module_udid = module.udid;
                 allZones.push(zone);
-                this.log(`No cached data for changing zone: ${zone.zone.id}`);
+                this.log(`No fallback data for changing zone: ${zone.zone.id}`);
               }
             }
           }
@@ -112,31 +132,54 @@ class TechApp extends Homey.App {
       }
 
       this.cache.set('Zones', allZones);
-      // this.log(`Got zone data from API: ${JSON.stringify(allZones)}`);
+      this._lastZonesData = allZones; // Keep backup for duringChange fallback
 
       return allZones;
     } catch (err) {
       this.log(`Got error when scanning for zones: ${err.message}`);
+      // Return last known data on error instead of null
+      if (this._lastZonesData) {
+        this.log('Returning last known zones data after error');
+        return this._lastZonesData;
+      }
       return null;
     }
   }
 
   async onPoll() {
+    // Skip polling if a write operation is in progress
+    if (this._isWriting) {
+      this.log('!!! Polling skipped - write operation in progress');
+      const nextPoll = Number(this.pollInterval * 1000);
+      this.timerID = this.homey.setTimeout(this.onPoll, nextPoll);
+      return;
+    }
+
     this.timerProcessing = true;
     this.log('!!! Polling started...');
-    const promises = [];
 
     try {
+      // Force refresh zones from API once at the start of polling
+      const zones = await this.getZones(true);
+      
+      if (!zones) {
+        this.log('!!! Polling aborted - no zones data');
+        return;
+      }
+
       const drivers = this.homey.drivers.getDrivers();
       for (const driver of Object.values(drivers)) {
         const devices = driver.getDevices();
         for (const device of devices) {
-          if (device.__updateDevice) {
-            promises.push(await device.__updateDevice());
+          if (device.__updateDeviceFromCache) {
+            // Use new method that reads from cache only (no API calls)
+            await device.__updateDeviceFromCache(zones);
+          } else if (device.__updateDevice) {
+            // Fallback to old method
+            await device.__updateDevice();
           }
         }
       }
-      await Promise.all(promises);
       this.log('!!! Polling ended.');
     } catch (err) {
       this.log(`Polling error: ${err.message}`);
@@ -154,8 +197,11 @@ class TechApp extends Homey.App {
     mode_parent_id,
     target_temperature,
   }) {
+    // Set write lock to prevent race conditions with polling
+    this._isWriting = true;
+    
     try {
-      const cachedZones = this.cache.get('Zones');
+      const cachedZones = this.cache.get('Zones') || this._lastZonesData;
       let currentScheduleIndex = 0;
 
       if (cachedZones) {
@@ -166,9 +212,11 @@ class TechApp extends Homey.App {
           if (typeof zoneToUpdate.mode.scheduleIndex !== 'undefined') {
             currentScheduleIndex = zoneToUpdate.mode.scheduleIndex;
           }
+          // Update both cache and backup
           zoneToUpdate.zone.setTemperature = target_temperature * 10;
           zoneToUpdate.mode.setTemperature = target_temperature * 10;
           this.cache.set('Zones', cachedZones);
+          this._lastZonesData = cachedZones;
           this.log(`Updated cached temperature for zone ${mode_parent_id} (${zoneToUpdate.description.name}) to ${target_temperature}`);
         }
       }
@@ -187,12 +235,20 @@ class TechApp extends Homey.App {
           },
         },
       });
-      await this.delay(5000);
-      await this.getZones();
+
+      // Reduced delay - just enough for API to process
+      await this.delay(1000);
+
+      // Don't force refresh here - trust our cache update
+      // The next poll cycle will pick up any discrepancies
+      
       return success;
     } catch (err) {
       this.log(`Got error when modifying zone: ${err.message}`);
       return null;
+    } finally {
+      // Always release the write lock
+      this._isWriting = false;
     }
   }
 
@@ -288,12 +344,9 @@ class TechApp extends Homey.App {
       opts.headers['Content-Type'] = 'application/json';
     }
 
-    // this.log(`API URL: ${url}`);
-    // this.log(`API request: ${JSON.stringify(opts)}`);
-
     const maxRetries = 5;
     let attempt = 0;
-    let backoffDelay = 10000; // Start with 10 seconds
+    let backoffDelay = 5000; // Reduced from 10 seconds to 5
 
     while (attempt <= maxRetries) {
       try {
@@ -335,9 +388,10 @@ class TechApp extends Homey.App {
             throw new Error(`Max retries reached. Server error: ${res.status}`);
           }
 
-          this.log(`Server error encountered. Retrying indefinitely. Next retry in ${backoffDelay / 1000} seconds... (${attempt + 1}/${maxRetries})`);
+          this.log(`Server error encountered. Retrying in ${backoffDelay / 1000} seconds... (${attempt + 1}/${maxRetries})`);
           await this.delay(backoffDelay);
           backoffDelay *= 2; // Exponential backoff
+          attempt++;
           continue;
         } else {
           // Other errors, do not retry

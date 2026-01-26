@@ -85,6 +85,51 @@ class Zone extends Device {
     this.log('Zone has been deleted');
   }
 
+  /**
+   * Update device from pre-fetched zones data (no API call).
+   * Used by polling to avoid multiple getZones() calls.
+   * @param {Array} zones - Pre-fetched zones data
+   */
+  async __updateDeviceFromCache(zones) {
+    try {
+      // Handle null/undefined zones
+      if (!zones) {
+        throw new Error('Zones data is null/undefined');
+      }
+
+      const zone = zones.find(z => z.zone.id === this.zone_id && z.module_udid === this.module_udid);
+
+      // Handle zone not found
+      if (!zone) {
+        throw new Error(`Zone ${this.zone_id} not found in zones data`);
+      }
+
+      // Success - reset failure count and ensure device is available
+      this._failureCount = 0;
+      if (!this.getAvailable()) {
+        await this.setAvailable();
+        this.log('Device is now available again');
+      }
+
+      await this.setCapabilityValueLogIfChanged('target_temperature', zone.zone.setTemperature / 10);
+      await this.setCapabilityValueLogIfChanged('measure_temperature', zone.zone.currentTemperature / 10);
+      await this.setCapabilityValueLogIfChanged('measure_battery', zone.zone.batteryLevel);
+    } catch (err) {
+      this._failureCount++;
+      this.error(`Error in __updateDeviceFromCache (attempt ${this._failureCount}/${this._maxFailures}): ${err.message}`);
+
+      // Mark device unavailable after consecutive failures
+      if (this._failureCount >= this._maxFailures && this.getAvailable()) {
+        await this.setUnavailable('Connection lost - retrying...');
+        this.error('Device marked as unavailable due to repeated failures');
+      }
+    }
+  }
+
+  /**
+   * Update device by fetching zones from API.
+   * Used for initial load and settings changes.
+   */
   async __updateDevice() {
     try {
       const zones = await this.homey.app.getZones();
@@ -108,9 +153,9 @@ class Zone extends Device {
         this.log('Device is now available again');
       }
 
-      this.setCapabilityValueLogIfChanged('target_temperature', zone.zone.setTemperature / 10);
-      this.setCapabilityValueLogIfChanged('measure_temperature', zone.zone.currentTemperature / 10);
-      this.setCapabilityValueLogIfChanged('measure_battery', zone.zone.batteryLevel);
+      await this.setCapabilityValueLogIfChanged('target_temperature', zone.zone.setTemperature / 10);
+      await this.setCapabilityValueLogIfChanged('measure_temperature', zone.zone.currentTemperature / 10);
+      await this.setCapabilityValueLogIfChanged('measure_battery', zone.zone.batteryLevel);
     } catch (err) {
       this._failureCount++;
       this.error(`Error in __updateDevice (attempt ${this._failureCount}/${this._maxFailures}): ${err.message}`);
