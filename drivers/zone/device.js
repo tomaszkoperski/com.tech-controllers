@@ -32,7 +32,7 @@ class Zone extends Device {
 
     this.registerCapabilityListener('target_temperature', async value => {
       // set temperature
-      this.log(`Setting temperature in zone ${this.getName()} to: ${value}`);
+      // Debug: this.log(`Setting temperature in zone ${this.getName()} to: ${value}`);
       await this.homey.app.setZone({
         module_udid: this.module_udid,
         mode_id: this.mode_id,
@@ -180,7 +180,7 @@ class Zone extends Device {
   async setCapabilityValueLogIfChanged(capability, value) {
     const currentValue = await this.getCapabilityValue(capability);
     if (currentValue !== value) {
-      this.log(`setCapability in ${this.getName()}: ${capability}: ${value} (was: ${currentValue})`);
+      // Debug: this.log(`setCapability in ${this.getName()}: ${capability}: ${value} (was: ${currentValue})`);
       try {
         await this.setCapabilityValue(capability, value);
       } catch (err) {
