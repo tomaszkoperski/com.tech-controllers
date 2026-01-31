@@ -70,12 +70,12 @@ class TechApp extends Homey.App {
     if (this._isWriting && !forceRefresh) {
       const cachedZones = this.cache.get('Zones');
       if (cachedZones) {
-        // Debug: this.log('Write in progress, returning cached zones');
+        this.log('Write in progress, returning cached zones');
         return cachedZones;
       }
       // If no cache but write in progress, return last known data
       if (this._lastZonesData) {
-        // Debug: this.log('Write in progress, no cache, returning last known zones');
+        this.log('Write in progress, no cache, returning last known zones');
         return this._lastZonesData;
       }
     }
@@ -96,7 +96,7 @@ class TechApp extends Homey.App {
       const fallbackZones = this._lastZonesData || cachedZones;
 
       for (const module of modules) {
-        // Debug: this.log(`Got module ${module.udid} (${module.name}). Scanning for zone changes...`);
+        this.log(`Got module ${module.udid} (${module.name}). Scanning for zone changes...`);
 
         const response = await this._call({
           method: 'get',
@@ -156,7 +156,7 @@ class TechApp extends Homey.App {
     }
 
     this.timerProcessing = true;
-    // Debug: this.log('!!! Polling started...');
+    this.log('!!! Polling started...');
 
     try {
       // Force refresh zones from API once at the start of polling
@@ -180,13 +180,13 @@ class TechApp extends Homey.App {
           }
         }
       }
-      // Debug: this.log('!!! Polling ended.');
+      this.log('!!! Polling ended.');
     } catch (err) {
       this.log(`Polling error: ${err.message}`);
     }
 
     const nextPoll = Number(this.pollInterval * 1000);
-    // Debug: this.log(`Next poll in ${this.pollInterval} seconds`);
+    this.log(`Next poll in ${this.pollInterval} seconds`);
     this.timerID = this.homey.setTimeout(this.onPoll, nextPoll);
     this.timerProcessing = false;
   }
@@ -217,7 +217,7 @@ class TechApp extends Homey.App {
           zoneToUpdate.mode.setTemperature = target_temperature * 10;
           this.cache.set('Zones', cachedZones);
           this._lastZonesData = cachedZones;
-          // Debug: this.log(`Updated cached temperature for zone ${mode_parent_id} (${zoneToUpdate.description.name}) to ${target_temperature}`);
+          this.log(`Updated cached temperature for zone ${mode_parent_id} (${zoneToUpdate.description.name}) to ${target_temperature}`);
         }
       }
 
@@ -295,7 +295,7 @@ class TechApp extends Homey.App {
 
   async refreshToken() {
     try {
-      // Debug: this.log('Refreshing eModul API token and user_id');
+      this.log('Refreshing eModul API token and user_id');
       const response = await this._call({
         method: 'post',
         path: '/authentication',
@@ -307,7 +307,7 @@ class TechApp extends Homey.App {
 
       this.token = response.token;
       this.user_id = response.user_id;
-      // Debug: this.log(`Got token! user_id: ${this.user_id}`);
+      this.log(`Got token! user_id: ${this.user_id}`);
       return true;
     } catch (err) {
       this.log(`Got error while refreshing token: ${err.message}`);
