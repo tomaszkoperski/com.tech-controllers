@@ -317,6 +317,16 @@ class TechApp extends Homey.App {
 
   /**
    * API helper method to make HTTP requests with retry and backoff logic.
+   * 
+   * Retry behavior:
+   * - Auth errors (401/403): Limited retries (5), then fail
+   * - Server errors (5xx): Unlimited retries with capped backoff
+   * - Network errors: Unlimited retries with capped backoff
+   * - Client errors (4xx): No retry, fail immediately
+   * 
+   * Backoff: Starts at 10s, doubles each retry, caps at 5 minutes.
+   * Resets to initial value on success.
+   * 
    * @param {Object} params - The request parameters.
    * @param {string} params.method - HTTP method (e.g., 'get', 'post').
    * @param {string} params.path - API endpoint path.
@@ -344,29 +354,40 @@ class TechApp extends Homey.App {
       opts.headers['Content-Type'] = 'application/json';
     }
 
-    const maxRetries = 5;
-    let attempt = 0;
-    let backoffDelay = 5000; // Reduced from 10 seconds to 5
+    const maxAuthRetries = 5;          // Limited retries for auth errors
+    const initialBackoff = 10000;      // 10 seconds
+    const maxBackoff = 300000;         // 5 minutes cap
+    
+    let authAttempt = 0;
+    
+    // Use instance-level backoff so it persists across calls during outage
+    // but resets on success
+    if (!this._currentBackoff) {
+      this._currentBackoff = initialBackoff;
+    }
 
-    while (attempt <= maxRetries) {
+    while (true) {
       try {
         const res = await fetch(url, opts);
 
         if (res.ok) {
+          // Success! Reset backoff for future calls
+          this._currentBackoff = initialBackoff;
           const resJson = await res.json();
           return resJson;
         }
 
         const err = new Error(`API error occurred: response status is ${res.status}`);
         err.code = res.status;
-        this.log(err);
+        this.log(err.message);
 
         if (res.status === 401 || res.status === 403) {
-          if (attempt === maxRetries) {
+          // Auth errors - limited retries
+          if (authAttempt >= maxAuthRetries) {
             throw new Error('Max retries reached. Authorization failed.');
           }
 
-          this.log(`Attempting to refresh token... (${attempt + 1}/${maxRetries})`);
+          this.log(`Attempting to refresh token... (${authAttempt + 1}/${maxAuthRetries})`);
           this.token = '';
           const refreshed = await this.refreshToken();
 
@@ -374,35 +395,36 @@ class TechApp extends Homey.App {
             throw new Error('Failed to refresh token.');
           }
 
-          // Update the Authorization header with the new token
           opts.headers['Authorization'] = `Bearer ${this.token}`;
-
-          // Wait before retrying
-          await this.delay(backoffDelay);
-          backoffDelay *= 2; // Exponential backoff
-          attempt++;
+          authAttempt++;
+          
+          await this.delay(this._currentBackoff);
+          this._currentBackoff = Math.min(this._currentBackoff * 2, maxBackoff);
           continue;
+          
         } else if (res.status >= 500 && res.status < 600) {
-          // Server errors, retry
-          if (attempt === maxRetries) {
-            throw new Error(`Max retries reached. Server error: ${res.status}`);
-          }
-
-          this.log(`Server error encountered. Retrying in ${backoffDelay / 1000} seconds... (${attempt + 1}/${maxRetries})`);
-          await this.delay(backoffDelay);
-          backoffDelay *= 2; // Exponential backoff
-          attempt++;
+          // Server errors - unlimited retries with capped backoff
+          this.log(`Server error ${res.status}. Retrying in ${this._currentBackoff / 1000}s...`);
+          
+          await this.delay(this._currentBackoff);
+          this._currentBackoff = Math.min(this._currentBackoff * 2, maxBackoff);
           continue;
+          
         } else {
-          // Other errors, do not retry
+          // Client errors (4xx other than auth) - do not retry
           throw err;
         }
       } catch (err) {
-        this.log(`Error during API call: ${err.message}`);
-        if (attempt === maxRetries) {
+        // Network errors - unlimited retries with capped backoff
+        if (err.code && err.code >= 400 && err.code < 500) {
+          // Re-throw client errors (already handled above, but just in case)
           throw err;
         }
-        attempt++;
+        
+        this.log(`Network error: ${err.message}. Retrying in ${this._currentBackoff / 1000}s...`);
+        
+        await this.delay(this._currentBackoff);
+        this._currentBackoff = Math.min(this._currentBackoff * 2, maxBackoff);
       }
     }
   }
