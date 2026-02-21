@@ -31,14 +31,16 @@ class Zone extends Device {
     this._maxFailures = 3;
 
     this.registerCapabilityListener('target_temperature', async value => {
-      // set temperature
       this.log(`Setting temperature in zone ${this.getName()} to: ${value}`);
-      await this.homey.app.setZone({
+      const result = await this.homey.app.setZone({
         module_udid: this.module_udid,
         mode_id: this.mode_id,
         mode_parent_id: this.zone_id,
         target_temperature: value,
       });
+      if (result === null) {
+        throw new Error(`Failed to set temperature to ${value}° — eModul API unavailable`);
+      }
     });
 
     await this.__updateDevice();

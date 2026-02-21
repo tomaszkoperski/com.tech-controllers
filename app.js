@@ -1,8 +1,5 @@
 'use strict';
 
-const {
-  throws,
-} = require('assert');
 const Homey = require('homey');
 const fetch = require('node-fetch');
 const Cache = require('node-cache');
@@ -187,8 +184,7 @@ class TechApp extends Homey.App {
           },
         },
       });
-      await this.delay(5000);
-      await this.getZones();
+      // No delay — cache is already updated, next poll will reconcile
       return success;
     } catch (err) {
       this.log(`Got error when modifying zone: ${err.message}`);
@@ -273,6 +269,7 @@ class TechApp extends Homey.App {
     const opts = {
       method: method.toUpperCase(),
       headers: {},
+      timeout: 15000, // 15 second timeout for node-fetch
     };
 
     if (this.token) {
@@ -288,66 +285,74 @@ class TechApp extends Homey.App {
       opts.headers['Content-Type'] = 'application/json';
     }
 
-    // this.log(`API URL: ${url}`);
-    // this.log(`API request: ${JSON.stringify(opts)}`);
-
-    const maxRetries = 5;
+    const maxRetries = 3;
     let attempt = 0;
-    let backoffDelay = 10000; // Start with 10 seconds
+    let backoffDelay = 5000; // Start with 5 seconds
+    const maxBackoff = 30000; // Cap at 30 seconds
 
     while (attempt <= maxRetries) {
       try {
+        this.log(`[API] → ${opts.method} ${path} (attempt ${attempt + 1}/${maxRetries + 1})`);
+        const startTime = Date.now();
         const res = await fetch(url, opts);
+        const elapsed = Date.now() - startTime;
 
         if (res.ok) {
+          this.log(`[API] ← ${res.status} OK (${elapsed}ms)`);
           const resJson = await res.json();
           return resJson;
         }
 
-        const err = new Error(`API error occurred: response status is ${res.status}`);
-        err.code = res.status;
-        this.log(err);
+        // Log error details
+        let responseBody = '';
+        try {
+          responseBody = await res.text();
+        } catch (e) {
+          responseBody = '(unreadable)';
+        }
+        this.error(`[API] ← ${res.status} on ${opts.method} ${path} (${elapsed}ms): ${responseBody.substring(0, 200)}`);
 
         if (res.status === 401 || res.status === 403) {
-          if (attempt === maxRetries) {
-            throw new Error('Max retries reached. Authorization failed.');
+          if (attempt >= maxRetries) {
+            throw new Error(`Authorization failed after ${maxRetries + 1} attempts`);
           }
 
-          this.log(`Attempting to refresh token... (${attempt + 1}/${maxRetries})`);
+          this.log(`[API] Refreshing token... (attempt ${attempt + 1}/${maxRetries + 1})`);
           this.token = '';
           const refreshed = await this.refreshToken();
 
           if (!refreshed) {
-            throw new Error('Failed to refresh token.');
+            throw new Error('Failed to refresh token');
           }
 
-          // Update the Authorization header with the new token
           opts.headers['Authorization'] = `Bearer ${this.token}`;
-
-          // Wait before retrying
           await this.delay(backoffDelay);
-          backoffDelay *= 2; // Exponential backoff
+          backoffDelay = Math.min(backoffDelay * 2, maxBackoff);
           attempt++;
           continue;
         } else if (res.status >= 500 && res.status < 600) {
-          // Server errors, retry
-          if (attempt === maxRetries) {
-            throw new Error(`Max retries reached. Server error: ${res.status}`);
+          if (attempt >= maxRetries) {
+            throw new Error(`Server error ${res.status} after ${maxRetries + 1} attempts`);
           }
 
-          this.log(`Server error encountered. Retrying indefinitely. Next retry in ${backoffDelay / 1000} seconds... (${attempt + 1}/${maxRetries})`);
+          this.log(`[API] Server error ${res.status}. Retrying in ${backoffDelay / 1000}s...`);
           await this.delay(backoffDelay);
-          backoffDelay *= 2; // Exponential backoff
+          backoffDelay = Math.min(backoffDelay * 2, maxBackoff);
+          attempt++;
           continue;
         } else {
-          // Other errors, do not retry
-          throw err;
+          throw new Error(`API error: HTTP ${res.status}`);
         }
       } catch (err) {
-        this.log(`Error during API call: ${err.message}`);
-        if (attempt === maxRetries) {
+        if (err.type === 'request-timeout' || err.name === 'AbortError') {
+          this.error(`[API] Timeout on ${opts.method} ${path}`);
+        }
+        if (attempt >= maxRetries) {
           throw err;
         }
+        this.log(`[API] Error: ${err.message}. Retrying in ${backoffDelay / 1000}s...`);
+        await this.delay(backoffDelay);
+        backoffDelay = Math.min(backoffDelay * 2, maxBackoff);
         attempt++;
       }
     }
