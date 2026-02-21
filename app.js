@@ -22,9 +22,10 @@ class TechApp extends Homey.App {
       return;
     }
 
-    if (this.cachettl < 30) {
-      this.cachettl = 30;
-      this.pollInterval = 31;
+    // Enforce minimum 1s (recommended: 30s+)
+    if (this.cachettl < 1) {
+      this.cachettl = 1;
+      this.pollInterval = 2;
     }
 
     this.cache = new Cache({
@@ -32,13 +33,25 @@ class TechApp extends Homey.App {
     });
 
     this.homey.settings.on('set', async key => {
-      this.log('App settings updated...');
-      this.username = this.homey.settings.get('username');
-      this.password = this.homey.settings.get('password');
-      this.cachettl = Number(this.homey.settings.get('cachettl'));
-      this.cache.stdTTL = this.cachettl;
-      await this.refreshToken();
-      await this.getZones();
+      this.log(`App setting changed: ${key}`);
+
+      if (key === 'username' || key === 'password') {
+        this.username = this.homey.settings.get('username');
+        this.password = this.homey.settings.get('password');
+        await this.refreshToken();
+        await this.getZones();
+      }
+
+      if (key === 'cachettl') {
+        const newTTL = Math.max(1, Number(this.homey.settings.get('cachettl')) || 60);
+        this.cachettl = newTTL;
+        this.pollInterval = newTTL + 1;
+        this.cache.options.stdTTL = newTTL;
+        this.log(`Polling interval updated to ${this.pollInterval}s (TTL: ${newTTL}s)`);
+
+        // Restart polling with new interval
+        this._restartPolling();
+      }
     });
 
     // Let's make sure we have a fresh token.
@@ -54,6 +67,14 @@ class TechApp extends Homey.App {
     this.timerID = this.homey.setTimeout(this.onPoll, 10000);
 
     this.log('App finished init');
+  }
+
+  _restartPolling() {
+    if (this.timerID) {
+      this.homey.clearTimeout(this.timerID);
+    }
+    this.log(`Restarting polling with interval ${this.pollInterval}s`);
+    this.timerID = this.homey.setTimeout(this.onPoll, 1000);
   }
 
   async getZones() {

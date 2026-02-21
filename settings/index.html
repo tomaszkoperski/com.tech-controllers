@@ -34,8 +34,9 @@
         <p data-i18n="settings.cache-desc">
 
         <div class="field row">
-          <label for="cachettl">TTL</label>
-          <input id="cachettl" type="text" value="" />
+          <label for="cachettl">Polling interval (seconds)</label>
+          <input id="cachettl" type="number" min="1" value="60" />
+          <p style="font-size:11px;color:#888;margin:4px 0 0;">Minimum: 1s. Recommended: 30s or more. Lower values increase API load and may cause errors.</p>
         </div>
       </fieldset>
 

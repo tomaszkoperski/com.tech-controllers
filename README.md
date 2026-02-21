@@ -14,6 +14,11 @@ The app was built and tested on:
 The app uses the emodul.eu / emodul.pl API to read and send data, so it should work with other hardware.
 Please ensure you provide your emodul login credentials in the app settings after installation.
 
+## API Documentation
+* [eModul API v1.0 (OpenAPI)](https://api-documentation.emodul.eu/) — official REST API docs
+* Base URL: `https://emodul.eu/api/v1`
+* No documented rate limits (as of Feb 2026). Recommended polling interval: 30s+.
+
 ## Known Issues
 See the [Issue Tracker](https://github.com/tomaszkoperski/com.tech-controllers/issues)
 
