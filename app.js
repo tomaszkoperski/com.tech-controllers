@@ -14,18 +14,17 @@ class TechApp extends Homey.App {
 
     this.username = this.homey.settings.get('username');
     this.password = this.homey.settings.get('password');
-    this.cachettl = Number(this.homey.settings.get('cachettl'));
-    this.pollInterval = Number(this.homey.settings.get('cachettl')) + 1;
+    this.cachettl = Number(this.homey.settings.get('cachettl')) || 60;
+    this.pollInterval = this.cachettl + 1;
 
     if (typeof this.username === 'undefined') {
       this.log('eModul credentials are missing!');
       return;
     }
 
-    if (this.cachettl < 60 || this.pollInterval < 61) {
-      this.homey.settings.set('cachettl', 60);
-      this.cachettl = 60;
-      this.pollInterval = 61;
+    if (this.cachettl < 30) {
+      this.cachettl = 30;
+      this.pollInterval = 31;
     }
 
     this.cache = new Cache({
