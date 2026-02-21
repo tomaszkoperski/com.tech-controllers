@@ -30,7 +30,22 @@ class Zone extends Device {
     this._failureCount = 0;
     this._maxFailures = 3;
 
+    this._deviceReady = false;
+
     this.registerCapabilityListener('target_temperature', async value => {
+      // Wait for device initialization before accepting commands
+      if (!this._deviceReady) {
+        this.log(`Queuing temperature set for ${this.getName()} to ${value}° (device not ready yet)`);
+        // Wait up to 30s for device to be ready
+        const deadline = Date.now() + 30000;
+        while (!this._deviceReady && Date.now() < deadline) {
+          await new Promise(resolve => this.homey.setTimeout(resolve, 1000));
+        }
+        if (!this._deviceReady) {
+          throw new Error(`Device not ready after 30s — cannot set temperature`);
+        }
+      }
+
       this.log(`Setting temperature in zone ${this.getName()} to: ${value}`);
       const result = await this.homey.app.setZone({
         module_udid: this.module_udid,
@@ -44,6 +59,8 @@ class Zone extends Device {
     });
 
     await this.__updateDevice();
+    this._deviceReady = true;
+    this.log(`Device ${this.getName()} ready`);
   }
 
   /**
