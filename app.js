@@ -1,8 +1,5 @@
 'use strict';
 
-const {
-  throws,
-} = require('assert');
 const Homey = require('homey');
 const fetch = require('node-fetch');
 const Cache = require('node-cache');
@@ -17,18 +14,18 @@ class TechApp extends Homey.App {
 
     this.username = this.homey.settings.get('username');
     this.password = this.homey.settings.get('password');
-    this.cachettl = Number(this.homey.settings.get('cachettl'));
-    this.pollInterval = Number(this.homey.settings.get('cachettl')) + 1;
+    this.cachettl = Number(this.homey.settings.get('cachettl')) || 60;
+    this.pollInterval = this.cachettl + 1;
 
     if (typeof this.username === 'undefined') {
       this.log('eModul credentials are missing!');
       return;
     }
 
-    if (this.cachettl < 60 || this.pollInterval < 61) {
-      this.homey.settings.set('cachettl', 60);
-      this.cachettl = 60;
-      this.pollInterval = 61;
+    // Enforce minimum 1s (recommended: 30s+)
+    if (this.cachettl < 1) {
+      this.cachettl = 1;
+      this.pollInterval = 2;
     }
 
     this.cache = new Cache({
@@ -41,13 +38,23 @@ class TechApp extends Homey.App {
     this._lastZonesData = null; // Backup of last known zones data for duringChange fallback
 
     this.homey.settings.on('set', async key => {
-      this.log('App settings updated...');
-      this.username = this.homey.settings.get('username');
-      this.password = this.homey.settings.get('password');
-      this.cachettl = Number(this.homey.settings.get('cachettl'));
-      this.cache.stdTTL = this.cachettl;
-      await this.refreshToken();
-      await this.getZones(true); // Force refresh
+      this.log(`App setting changed: ${key}`);
+
+      if (key === 'username' || key === 'password') {
+        this.username = this.homey.settings.get('username');
+        this.password = this.homey.settings.get('password');
+        await this.refreshToken();
+        await this.getZones(true);
+      }
+
+      if (key === 'cachettl') {
+        const newTTL = Math.max(1, Number(this.homey.settings.get('cachettl')) || 60);
+        this.cachettl = newTTL;
+        this.pollInterval = newTTL + 1;
+        this.cache.options.stdTTL = newTTL;
+        this.log(`Polling interval updated to ${this.pollInterval}s (TTL: ${newTTL}s)`);
+        this._restartPolling();
+      }
     });
 
     // Let's make sure we have a fresh token.
@@ -63,6 +70,14 @@ class TechApp extends Homey.App {
     this.timerID = this.homey.setTimeout(this.onPoll, 10000);
 
     this.log('App finished init');
+  }
+
+  _restartPolling() {
+    if (this.timerID) {
+      this.homey.clearTimeout(this.timerID);
+    }
+    this.log(`Restarting polling with interval ${this.pollInterval}s`);
+    this.timerID = this.homey.setTimeout(this.onPoll, 1000);
   }
 
   async getZones(forceRefresh = false) {
@@ -339,6 +354,7 @@ class TechApp extends Homey.App {
     const opts = {
       method: method.toUpperCase(),
       headers: {},
+      timeout: 15000, // 15 second timeout
     };
 
     if (this.token) {
@@ -368,9 +384,13 @@ class TechApp extends Homey.App {
 
     while (true) {
       try {
+        this.log(`[API] → ${method.toUpperCase()} ${path}`);
+        const startTime = Date.now();
         const res = await fetch(url, opts);
+        const elapsed = Date.now() - startTime;
 
         if (res.ok) {
+          this.log(`[API] ← ${res.status} OK (${elapsed}ms)`);
           // Success! Reset backoff for future calls
           this._currentBackoff = initialBackoff;
           const resJson = await res.json();
@@ -387,8 +407,8 @@ class TechApp extends Homey.App {
         
         const err = new Error(`API error occurred: response status is ${res.status}`);
         err.code = res.status;
-        this.error(`API error ${res.status} on ${method.toUpperCase()} ${path}`);
-        this.error(`Response body: ${responseBody.substring(0, 500)}`);
+        this.error(`[API] ← ${res.status} on ${method.toUpperCase()} ${path} (${elapsed}ms)`);
+        this.error(`[API] Response: ${responseBody.substring(0, 500)}`);
 
         if (res.status === 401 || res.status === 403) {
           // Auth errors - limited retries
@@ -429,8 +449,12 @@ class TechApp extends Homey.App {
           // Re-throw client errors (already handled above, but just in case)
           throw err;
         }
+
+        if (err.type === 'request-timeout' || err.name === 'AbortError') {
+          this.error(`[API] Timeout on ${method.toUpperCase()} ${path}`);
+        }
         
-        this.log(`Network error: ${err.message}. Retrying in ${this._currentBackoff / 1000}s...`);
+        this.log(`[API] Network error: ${err.message}. Retrying in ${this._currentBackoff / 1000}s...`);
         
         await this.delay(this._currentBackoff);
         this._currentBackoff = Math.min(this._currentBackoff * 2, maxBackoff);
