@@ -100,11 +100,8 @@ class TechApp extends Homey.App {
 
     this._consoleReEnabled = false;
 
-    // Restore original log/error if we previously wrapped them
-    if (this._originalLog) {
-      this.log = this._originalLog;
-      this.error = this._originalError;
-    }
+    // When disabling, the prototype wrappers stay but _consoleReEnabled=false
+    // prevents them from sending to console.re
 
     if (enabled && channel) {
       try {
@@ -115,25 +112,27 @@ class TechApp extends Homey.App {
         this._consoleReEnabled = true;
         this._consoleReChannel = channel;
 
-        // Wrap this.log and this.error to mirror everything to console.re
-        this._originalLog = this.log.bind(this);
-        this._originalError = this.error.bind(this);
+        // Intercept Homey's internal log stream by wrapping the prototype methods
+        if (!this._originalLog) {
+          this._originalLog = TechApp.prototype.log;
+          this._originalError = TechApp.prototype.error;
 
-        const self = this;
-        this.log = function (...args) {
-          self._originalLog(...args);
-          if (console.re && console.re.log) {
-            try { console.re.log('[TechApp]', ...args); } catch (e) { /* ignore */ }
-          }
-        };
-        this.error = function (...args) {
-          self._originalError(...args);
-          if (console.re && console.re.error) {
-            try { console.re.error('[TechApp]', ...args); } catch (e) { /* ignore */ }
-          }
-        };
+          const self = this;
+          TechApp.prototype.log = function (...args) {
+            self._originalLog.apply(this, args);
+            if (self._consoleReEnabled && console.re && console.re.log) {
+              try { console.re.log('[TechApp]', ...args); } catch (e) { /* ignore */ }
+            }
+          };
+          TechApp.prototype.error = function (...args) {
+            self._originalError.apply(this, args);
+            if (self._consoleReEnabled && console.re && console.re.error) {
+              try { console.re.error('[TechApp]', ...args); } catch (e) { /* ignore */ }
+            }
+          };
+        }
 
-        this._originalLog(`[ConsoleRe] Connected to channel: ${channel}`);
+        this.log(`[ConsoleRe] Connected to channel: ${channel}`);
       } catch (e) {
         this.log(`[ConsoleRe] Failed to connect: ${e.message}`);
       }
