@@ -17,7 +17,7 @@ class Zone extends Device {
 
     // Track consecutive failures for availability management
     this._failureCount = 0;
-    this._maxFailures = 3;
+    this._maxFailures = 10; // High threshold — only mark unavailable after sustained failures
 
     this.registerCapabilityListener('target_temperature', async value => {
       this.log(`→ Set ${value}°`);
@@ -75,10 +75,12 @@ class Zone extends Device {
       }
 
       this._failureCount = 0;
+      // Always ensure device is available after a successful update.
+      // This recovers from any prior setUnavailable() or transient errors.
       if (!this.getAvailable()) {
-        await this.setAvailable();
-        this.log('Back online');
+        this.log('Recovering → available');
       }
+      await this.setAvailable();
 
       const newTarget = zone.zone.setTemperature / 10;
       const newCurrent = zone.zone.currentTemperature / 10;
@@ -126,9 +128,9 @@ class Zone extends Device {
 
       this._failureCount = 0;
       if (!this.getAvailable()) {
-        await this.setAvailable();
-        this.log('Back online');
+        this.log('Recovering → available');
       }
+      await this.setAvailable();
 
       await this._setIfChanged('target_temperature', zone.zone.setTemperature / 10);
       await this._setIfChanged('measure_temperature', zone.zone.currentTemperature / 10);
