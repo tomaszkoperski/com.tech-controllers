@@ -73,11 +73,11 @@ class TechApp extends Homey.App {
     // Let's make sure we have a fresh token.
     await this.refreshToken();
 
-    // Wait for devices to be ready
-    await this.waitForDevicesReady();
-
-    // Get zone data into cache, so when individual devices are refreshing we won't spam the API with requests.
-    await this.getZones(true); // Force initial fetch
+    // Get zone data into cache first, so devices can read from it during their init.
+    // NOTE: Do NOT call waitForDevicesReady() here — it creates a deadlock:
+    // app.onInit waits for device.onInit, but device.onInit calls app.getZones().
+    // Devices will get correct values from the first poll cycle.
+    await this.getZones(true);
 
     this.onPoll = this.onPoll.bind(this);
     this.timerID = this.homey.setTimeout(this.onPoll, 10000);
