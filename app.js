@@ -3,7 +3,7 @@
 const Homey = require('homey');
 const fetch = require('node-fetch');
 const Cache = require('node-cache');
-const consolere = require('console-remote-client');
+const ConsoleReLogger = require('./lib/consolere-logger');
 
 class TechApp extends Homey.App {
 
@@ -43,7 +43,8 @@ class TechApp extends Homey.App {
     this._currentBackoff = 10000; // 10s initial
 
     // console.re remote logging
-    this._initConsoleRe();
+    this._remote = new ConsoleReLogger(this, 'Tech Controllers', '1.2.2');
+    this._remote.init();
 
     this.homey.settings.on('set', async key => {
       this.log(`App setting changed: ${key}`);
@@ -65,7 +66,7 @@ class TechApp extends Homey.App {
       }
 
       if (key === 'consolere_enabled' || key === 'consolere_channel') {
-        this._initConsoleRe();
+        this._remote.init();
       }
     });
 
@@ -85,94 +86,18 @@ class TechApp extends Homey.App {
     this.rlog('App initialized. Polling interval:', this.pollInterval, 's');
   }
 
-  // ──────────────────────────────────────────────────────────────
-  // console.re remote logging
-  // ──────────────────────────────────────────────────────────────
-
-  _initConsoleRe() {
-    const enabled = this.homey.settings.get('consolere_enabled') === true;
-    const channel = this.homey.settings.get('consolere_channel');
-
-    // Disconnect previous connection if any
-    if (this._consoleReEnabled && console.re && console.re.disconnect) {
-      try { console.re.disconnect(); } catch (e) { /* ignore */ }
-    }
-
-    this._consoleReEnabled = false;
-
-    // When disabling, the prototype wrappers stay but _consoleReEnabled=false
-    // prevents them from sending to console.re
-
-    if (enabled && channel) {
-      try {
-        consolere.connect({
-          channel: channel,
-          server: 'https://console.re',
-        });
-        this._consoleReEnabled = true;
-        this._consoleReChannel = channel;
-
-        // Intercept Homey's internal log stream by wrapping the prototype methods
-        if (!this._originalLog) {
-          this._originalLog = TechApp.prototype.log;
-          this._originalError = TechApp.prototype.error;
-
-          const self = this;
-          TechApp.prototype.log = function (...args) {
-            self._originalLog.apply(this, args);
-            if (self._consoleReEnabled && console.re && console.re.log) {
-              try { console.re.log('[TechApp]', ...args); } catch (e) { /* ignore */ }
-            }
-          };
-          TechApp.prototype.error = function (...args) {
-            self._originalError.apply(this, args);
-            if (self._consoleReEnabled && console.re && console.re.error) {
-              try { console.re.error('[TechApp]', ...args); } catch (e) { /* ignore */ }
-            }
-          };
-        }
-
-        // Override the dispatch to show app name + version instead of "NodeJs 22.22.0 (Linux)"
-        if (console.re && console.re._dispatch) {
-          const origDispatch = console.re._dispatch.bind(console.re);
-          console.re._dispatch = function (level, args, cmd, cal) {
-            // Replace caller with app identifier
-            const customCaller = 'Tech Controllers v1.2.2 /app.js';
-            return origDispatch(level, args, cmd, customCaller);
-          };
-        }
-
-        this.log(`[ConsoleRe] Connected to channel: ${channel}`);
-      } catch (e) {
-        this.log(`[ConsoleRe] Failed to connect: ${e.message}`);
-      }
-    }
-  }
-
   /**
-   * Send a log message to console.re (if enabled).
+   * Send a log to console.re (if enabled). Shorthand for this._remote.log().
    */
   rlog(...args) {
-    if (this._consoleReEnabled && console.re && console.re.log) {
-      try {
-        console.re.log('[TechApp]', ...args);
-      } catch (e) {
-        // Silently ignore console.re errors
-      }
-    }
+    this._remote.log(...args);
   }
 
   /**
-   * Send an error message to console.re (if enabled).
+   * Send an error to console.re (if enabled). Shorthand for this._remote.error().
    */
   rerror(...args) {
-    if (this._consoleReEnabled && console.re && console.re.error) {
-      try {
-        console.re.error('[TechApp]', ...args);
-      } catch (e) {
-        // Silently ignore console.re errors
-      }
-    }
+    this._remote.error(...args);
   }
 
   _restartPolling() {
