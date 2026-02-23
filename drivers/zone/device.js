@@ -31,7 +31,13 @@ class Zone extends Device {
       });
     });
 
-    await this.__updateDevice();
+    // Don't let a failed initial update prevent device from becoming ready.
+    // Polling will catch up with correct values on the next cycle.
+    try {
+      await this.__updateDevice();
+    } catch (err) {
+      this.error(`Init update failed (non-fatal): ${err.message}`);
+    }
     this.log('Ready');
   }
 
