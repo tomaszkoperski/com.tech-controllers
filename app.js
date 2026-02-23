@@ -132,6 +132,16 @@ class TechApp extends Homey.App {
           };
         }
 
+        // Override the dispatch to show app name + version instead of "NodeJs 22.22.0 (Linux)"
+        if (console.re && console.re._dispatch) {
+          const origDispatch = console.re._dispatch.bind(console.re);
+          console.re._dispatch = function (level, args, cmd, cal) {
+            // Replace caller with app identifier
+            const customCaller = 'Tech Controllers v1.2.2 /app.js';
+            return origDispatch(level, args, cmd, customCaller);
+          };
+        }
+
         this.log(`[ConsoleRe] Connected to channel: ${channel}`);
       } catch (e) {
         this.log(`[ConsoleRe] Failed to connect: ${e.message}`);
