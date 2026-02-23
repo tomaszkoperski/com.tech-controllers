@@ -451,7 +451,7 @@ class TechApp extends Homey.App {
         }
       }
       this.log('!!! Polling ended.');
-      this.rlog('✔️ Polling ended.', zones.length, 'zones');
+      this.rlog(`✔️ Polling ended. ${zones.length} zones`);
 
       // After a successful poll, retry any pending writes
       // (modules may have come back online)
