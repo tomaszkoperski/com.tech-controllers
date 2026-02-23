@@ -93,24 +93,39 @@ class TechApp extends Homey.App {
     const enabled = this.homey.settings.get('consolere_enabled') === true;
     const channel = this.homey.settings.get('consolere_channel');
 
+    // Disconnect previous connection if any
+    if (this._consoleReEnabled && console.re && console.re.disconnect) {
+      try { console.re.disconnect(); } catch (e) { /* ignore */ }
+    }
+
+    this._consoleReEnabled = false;
+
     if (enabled && channel) {
-      consolere.connect({
-        channel: channel,
-        server: 'https://console.re',
-      });
-      this._consoleReEnabled = true;
-      this.log(`[ConsoleRe] Connected to channel: ${channel}`);
+      try {
+        consolere.connect({
+          channel: channel,
+          server: 'https://console.re',
+        });
+        this._consoleReEnabled = true;
+        this._consoleReChannel = channel;
+        this.log(`[ConsoleRe] Connecting to channel: ${channel}`);
+        // Send a test message after a short delay to allow socket.io to connect
+        setTimeout(() => {
+          this.rlog('🚀 console.re logging connected for Tech Controllers');
+        }, 3000);
+      } catch (e) {
+        this.log(`[ConsoleRe] Failed to connect: ${e.message}`);
+      }
     } else {
-      this._consoleReEnabled = false;
+      this.log('[ConsoleRe] Disabled');
     }
   }
 
   /**
    * Send a log message to console.re (if enabled).
-   * Call this alongside this.log() for important events.
    */
   rlog(...args) {
-    if (this._consoleReEnabled) {
+    if (this._consoleReEnabled && console.re && console.re.log) {
       try {
         console.re.log('[TechApp]', ...args);
       } catch (e) {
@@ -123,7 +138,7 @@ class TechApp extends Homey.App {
    * Send an error message to console.re (if enabled).
    */
   rerror(...args) {
-    if (this._consoleReEnabled) {
+    if (this._consoleReEnabled && console.re && console.re.error) {
       try {
         console.re.error('[TechApp]', ...args);
       } catch (e) {
@@ -458,12 +473,14 @@ class TechApp extends Homey.App {
   async onPoll() {
     this.timerProcessing = true;
     this.log('!!! Polling started...');
+    this.rlog('🔄 Polling started...');
 
     try {
       const zones = await this.getZones(true);
 
       if (!zones) {
         this.log('!!! Polling aborted - no zones data');
+        this.rerror('⚠️ Polling aborted - no zones data');
         return;
       }
 
@@ -479,6 +496,7 @@ class TechApp extends Homey.App {
         }
       }
       this.log('!!! Polling ended.');
+      this.rlog('✔️ Polling ended.', zones.length, 'zones');
 
       // After a successful poll, retry any pending writes
       // (modules may have come back online)

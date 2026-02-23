@@ -101,9 +101,22 @@ class Zone extends Device {
         this.log('Device is now available again');
       }
 
-      await this.setCapabilityValueLogIfChanged('target_temperature', zone.zone.setTemperature / 10);
-      await this.setCapabilityValueLogIfChanged('measure_temperature', zone.zone.currentTemperature / 10);
+      const newTarget = zone.zone.setTemperature / 10;
+      const newCurrent = zone.zone.currentTemperature / 10;
+      const oldTarget = await this.getCapabilityValue('target_temperature');
+      const oldCurrent = await this.getCapabilityValue('measure_temperature');
+
+      await this.setCapabilityValueLogIfChanged('target_temperature', newTarget);
+      await this.setCapabilityValueLogIfChanged('measure_temperature', newCurrent);
       await this.setCapabilityValueLogIfChanged('measure_battery', zone.zone.batteryLevel);
+
+      // Remote log significant changes
+      if (oldTarget !== newTarget || oldCurrent !== newCurrent) {
+        this.homey.app.rlog(
+          `🌡️ ${this.getName()}: ${newCurrent}° (target: ${newTarget}°)` +
+          (oldTarget !== newTarget ? ` [target changed from ${oldTarget}°]` : '')
+        );
+      }
     } catch (err) {
       this._failureCount++;
       this.error(`Error in __updateDeviceFromCache (attempt ${this._failureCount}/${this._maxFailures}): ${err.message}`);
