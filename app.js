@@ -258,6 +258,7 @@ class TechApp extends Homey.App {
         // Attempt the write — single attempt, no infinite retry in _call
         try {
           this.log(`[WriteQueue] Writing zone ${zone_id} → ${writeReq.target_temperature}°`);
+          this.rlog(`✏️ Writing zone ${zone_id} → ${writeReq.target_temperature}°`);
           await this._call({
             method: 'post',
             path: `/users/${this.user_id}/modules/${module_udid}/zones`,
@@ -338,6 +339,7 @@ class TechApp extends Homey.App {
       this.cache.set('Zones', cachedZones);
       this._lastZonesData = cachedZones;
       this.log(`Updated cached temperature for zone ${zone_id} (${zoneData.description?.name || 'unknown'}) to ${target_temperature}`);
+      this.rlog(`💾 Cached zone ${zone_id} (${zoneData.description?.name || '?'}) → ${target_temperature}°`);
     }
   }
 
@@ -593,12 +595,14 @@ class TechApp extends Homey.App {
     while (attempt <= maxRetries) {
       try {
         this.log(`[API] → ${method.toUpperCase()} ${path}`);
+        this.rlog(`→ ${method.toUpperCase()} ${path}`);
         const startTime = Date.now();
         const res = await fetch(url, opts);
         const elapsed = Date.now() - startTime;
 
         if (res.ok) {
           this.log(`[API] ← ${res.status} OK (${elapsed}ms)`);
+          this.rlog(`← ${res.status} OK (${elapsed}ms) ${path}`);
           return await res.json();
         }
 
@@ -612,6 +616,7 @@ class TechApp extends Homey.App {
 
         this.error(`[API] ← ${res.status} on ${method.toUpperCase()} ${path} (${elapsed}ms)`);
         this.error(`[API] Response: ${responseBody.substring(0, 500)}`);
+        this.rerror(`← ${res.status} ${method.toUpperCase()} ${path} (${elapsed}ms)`);
 
         // 503 with "No module connection" — don't retry, signal to caller
         if (res.status === 503 && responseBody.includes('No module connection')) {
