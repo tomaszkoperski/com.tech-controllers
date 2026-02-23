@@ -32,10 +32,14 @@ class TechApp extends Homey.App {
       stdTTL: this.cachettl,
     });
 
-    // Mutex for preventing race conditions between setZone and polling
-    this._isWriting = false;
-    this._writeQueue = [];
-    this._lastZonesData = null; // Backup of last known zones data for duringChange fallback
+    // Write queue: per-module serialized writes
+    // Key: module_udid, Value: { pending: Map<zone_id, writeRequest>, processing: boolean }
+    this._writeQueues = {};
+    this._lastZonesData = null;
+    this._moduleOnline = {}; // Track module connectivity: module_udid -> boolean
+
+    // API backoff state (shared across all calls)
+    this._currentBackoff = 10000; // 10s initial
 
     this.homey.settings.on('set', async key => {
       this.log(`App setting changed: ${key}`);
@@ -80,21 +84,239 @@ class TechApp extends Homey.App {
     this.timerID = this.homey.setTimeout(this.onPoll, 1000);
   }
 
-  async getZones(forceRefresh = false) {
-    // If a write operation is in progress, return cached data to avoid race conditions
-    if (this._isWriting && !forceRefresh) {
-      const cachedZones = this.cache.get('Zones');
-      if (cachedZones) {
-        this.log('Write in progress, returning cached zones');
-        return cachedZones;
+  // ──────────────────────────────────────────────────────────────
+  // Write Queue — serialized per-module, deduplicating by zone
+  // ──────────────────────────────────────────────────────────────
+
+  /**
+   * Returns the write queue for a module, creating it if needed.
+   */
+  _getWriteQueue(module_udid) {
+    if (!this._writeQueues[module_udid]) {
+      this._writeQueues[module_udid] = {
+        pending: new Map(), // zone_id -> { module_udid, mode_id, mode_parent_id, target_temperature, timestamp }
+        processing: false,
+      };
+    }
+    return this._writeQueues[module_udid];
+  }
+
+  /**
+   * Check if any module has pending or in-progress writes.
+   */
+  _isAnyWriteInProgress() {
+    for (const q of Object.values(this._writeQueues)) {
+      if (q.processing || q.pending.size > 0) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Check if a specific zone has duringChange=true in cached data.
+   */
+  _isZoneChanging(module_udid, zone_id) {
+    const zones = this._lastZonesData;
+    if (!zones) return false;
+    const zone = zones.find(z => z.zone.id === zone_id && z.module_udid === module_udid);
+    return zone?.zone?.duringChange === true;
+  }
+
+  /**
+   * Enqueue a zone write. Replaces any previous pending write for the same zone.
+   * The queue processor will send only the latest value.
+   */
+  enqueueWrite({ module_udid, mode_id, mode_parent_id, target_temperature }) {
+    const queue = this._getWriteQueue(module_udid);
+
+    // Always replace — latest value wins
+    queue.pending.set(mode_parent_id, {
+      module_udid,
+      mode_id,
+      mode_parent_id,
+      target_temperature,
+      timestamp: Date.now(),
+    });
+
+    this.log(`[WriteQueue] Enqueued zone ${mode_parent_id} → ${target_temperature}° (module ${module_udid.substring(0, 8)}…, queue size: ${queue.pending.size})`);
+
+    // Update cache immediately so Homey UI reflects the change
+    this._updateCachedTemperature(module_udid, mode_parent_id, target_temperature);
+
+    // Kick off processing if not already running
+    if (!queue.processing) {
+      this._processWriteQueue(module_udid);
+    }
+  }
+
+  /**
+   * Process the write queue for a module. Sends one write at a time.
+   * Waits for duringChange to clear before sending the next one.
+   */
+  async _processWriteQueue(module_udid) {
+    const queue = this._getWriteQueue(module_udid);
+    if (queue.processing) return;
+    queue.processing = true;
+
+    this.log(`[WriteQueue] Processing started for module ${module_udid.substring(0, 8)}…`);
+
+    try {
+      while (queue.pending.size > 0) {
+        // Check if module is known to be offline
+        if (this._moduleOnline[module_udid] === false) {
+          this.log(`[WriteQueue] Module ${module_udid.substring(0, 8)}… is offline. Waiting for recovery before writing...`);
+          // Wait up to 5 minutes, checking every 30s
+          const offlineDeadline = Date.now() + 5 * 60 * 1000;
+          let recovered = false;
+          while (Date.now() < offlineDeadline && queue.pending.size > 0) {
+            await this.delay(30000);
+            // Try a lightweight check — just GET the module
+            try {
+              await this._call({
+                method: 'get',
+                path: `/users/${this.user_id}/modules/${module_udid}`,
+                maxRetries: 1,
+              });
+              this._moduleOnline[module_udid] = true;
+              recovered = true;
+              this.log(`[WriteQueue] Module ${module_udid.substring(0, 8)}… is back online!`);
+              break;
+            } catch (err) {
+              this.log(`[WriteQueue] Module still offline: ${err.message}`);
+            }
+          }
+          if (!recovered) {
+            this.log(`[WriteQueue] Module ${module_udid.substring(0, 8)}… still offline after 5 min. Writes remain queued for next poll cycle.`);
+            break; // Exit loop, writes stay in queue
+          }
+        }
+
+        // Pick the next write (oldest first, but since we dedup by zone, order is just insertion)
+        const [zone_id, writeReq] = queue.pending.entries().next().value;
+
+        // Wait for duringChange to clear (max 60s)
+        let changingWait = 0;
+        while (this._isZoneChanging(module_udid, zone_id) && changingWait < 60000) {
+          this.log(`[WriteQueue] Zone ${zone_id} has duringChange=true. Waiting...`);
+          await this.delay(5000);
+          changingWait += 5000;
+          // Refresh zone data to check again
+          await this.getZones(true);
+        }
+
+        if (this._isZoneChanging(module_udid, zone_id)) {
+          this.log(`[WriteQueue] Zone ${zone_id} still changing after 60s. Proceeding anyway.`);
+        }
+
+        // Check if this write was superseded while we waited
+        const currentWrite = queue.pending.get(zone_id);
+        if (!currentWrite || currentWrite.timestamp !== writeReq.timestamp) {
+          this.log(`[WriteQueue] Zone ${zone_id} write was superseded. Skipping stale value.`);
+          continue;
+        }
+
+        // Remove from pending before attempting (we'll re-queue on failure)
+        queue.pending.delete(zone_id);
+
+        // Get current scheduleIndex from cache
+        let currentScheduleIndex = 0;
+        const cachedZones = this.cache.get('Zones') || this._lastZonesData;
+        if (cachedZones) {
+          const zoneData = cachedZones.find(
+            z => z.module_udid === module_udid && z.zone.id === zone_id
+          );
+          if (zoneData?.mode?.scheduleIndex !== undefined) {
+            currentScheduleIndex = zoneData.mode.scheduleIndex;
+          }
+        }
+
+        // Attempt the write — single attempt, no infinite retry in _call
+        try {
+          this.log(`[WriteQueue] Writing zone ${zone_id} → ${writeReq.target_temperature}°`);
+          await this._call({
+            method: 'post',
+            path: `/users/${this.user_id}/modules/${module_udid}/zones`,
+            json: {
+              mode: {
+                id: writeReq.mode_id,
+                parentId: writeReq.mode_parent_id,
+                mode: 'constantTemp',
+                constTempTime: 0,
+                setTemperature: writeReq.target_temperature * 10,
+                scheduleIndex: currentScheduleIndex,
+              },
+            },
+            maxRetries: 3, // Limited retries per write attempt
+          });
+
+          this.log(`[WriteQueue] ✓ Zone ${zone_id} set to ${writeReq.target_temperature}°`);
+          this._moduleOnline[module_udid] = true;
+
+          // Small delay between writes to the same module
+          await this.delay(2000);
+        } catch (err) {
+          this.error(`[WriteQueue] ✗ Failed zone ${zone_id}: ${err.message}`);
+
+          // If module is offline (503), mark it and stop processing
+          if (err.moduleOffline) {
+            this._moduleOnline[module_udid] = false;
+            // Re-queue this write
+            queue.pending.set(zone_id, writeReq);
+            this.log(`[WriteQueue] Module offline. Re-queued zone ${zone_id}. Will retry on next poll.`);
+            break;
+          }
+
+          // For other errors, re-queue if within 15 min of original request
+          if (Date.now() - writeReq.timestamp < 15 * 60 * 1000) {
+            queue.pending.set(zone_id, writeReq);
+            this.log(`[WriteQueue] Re-queued zone ${zone_id} for retry.`);
+            await this.delay(10000);
+          } else {
+            this.error(`[WriteQueue] Giving up on zone ${zone_id} → ${writeReq.target_temperature}° (15 min timeout)`);
+          }
+        }
       }
-      // If no cache but write in progress, return last known data
-      if (this._lastZonesData) {
-        this.log('Write in progress, no cache, returning last known zones');
-        return this._lastZonesData;
+    } finally {
+      queue.processing = false;
+      this.log(`[WriteQueue] Processing ended for module ${module_udid.substring(0, 8)}… (${queue.pending.size} pending)`);
+    }
+  }
+
+  /**
+   * Retry pending writes for all modules. Called after successful polls.
+   */
+  retryPendingWrites() {
+    for (const [module_udid, queue] of Object.entries(this._writeQueues)) {
+      if (queue.pending.size > 0 && !queue.processing && this._moduleOnline[module_udid] !== false) {
+        this.log(`[WriteQueue] Retrying ${queue.pending.size} pending writes for module ${module_udid.substring(0, 8)}…`);
+        this._processWriteQueue(module_udid);
       }
     }
+  }
 
+  /**
+   * Update the cached temperature for a zone (for immediate UI feedback).
+   */
+  _updateCachedTemperature(module_udid, zone_id, target_temperature) {
+    const cachedZones = this.cache.get('Zones') || this._lastZonesData;
+    if (!cachedZones) return;
+
+    const zoneData = cachedZones.find(
+      z => z.module_udid === module_udid && z.zone.id === zone_id
+    );
+    if (zoneData) {
+      zoneData.zone.setTemperature = target_temperature * 10;
+      zoneData.mode.setTemperature = target_temperature * 10;
+      this.cache.set('Zones', cachedZones);
+      this._lastZonesData = cachedZones;
+      this.log(`Updated cached temperature for zone ${zone_id} (${zoneData.description?.name || 'unknown'}) to ${target_temperature}`);
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // Zone fetching
+  // ──────────────────────────────────────────────────────────────
+
+  async getZones(forceRefresh = false) {
     const cachedZones = this.cache.get('Zones');
     if (cachedZones !== undefined && !forceRefresh) {
       return cachedZones;
@@ -104,10 +326,10 @@ class TechApp extends Homey.App {
       const modules = await this._call({
         method: 'get',
         path: `/users/${this.user_id}/modules`,
+        maxRetries: 3,
       });
 
       const allZones = [];
-      // Use last known data for duringChange fallback (not current cache which might be empty)
       const fallbackZones = this._lastZonesData || cachedZones;
 
       for (const module of modules) {
@@ -116,43 +338,49 @@ class TechApp extends Homey.App {
         const response = await this._call({
           method: 'get',
           path: `/users/${this.user_id}/modules/${module.udid}`,
+          maxRetries: 3,
         });
+
+        // Module responded — mark as online
+        this._moduleOnline[module.udid] = true;
 
         const zones = response.zones.elements;
 
         for (const zone of zones) {
           if (zone && zone.zone.zoneState !== 'zoneOff') {
-            // Skip updating cache if zone is currently changing
-            if (!zone.zone.duringChange) {
-              zone.module_udid = module.udid;
-              allZones.push(zone);
-            } else {
-              // If zone is changing, use fallback data if available
+            zone.module_udid = module.udid;
+
+            if (zone.zone.duringChange) {
+              // Zone is currently applying a change — use fallback data to avoid
+              // overwriting Homey's UI with stale mid-transition values
               const fallbackZone = fallbackZones?.find(
-                cached => cached.zone.id === zone.zone.id && 
+                cached => cached.zone.id === zone.zone.id &&
                          cached.module_udid === module.udid
               );
               if (fallbackZone) {
                 allZones.push(fallbackZone);
-                this.log(`Using fallback data for changing zone: ${zone.zone.id}`);
+                this.log(`Zone ${zone.zone.id} has duringChange=true. Using cached data.`);
               } else {
-                // If no fallback data available, use current (API) data
-                zone.module_udid = module.udid;
                 allZones.push(zone);
-                this.log(`No fallback data for changing zone: ${zone.zone.id}`);
+                this.log(`Zone ${zone.zone.id} has duringChange=true but no fallback. Using API data.`);
               }
+            } else {
+              allZones.push(zone);
             }
           }
         }
       }
 
       this.cache.set('Zones', allZones);
-      this._lastZonesData = allZones; // Keep backup for duringChange fallback
+      this._lastZonesData = allZones;
 
       return allZones;
     } catch (err) {
       this.log(`Got error when scanning for zones: ${err.message}`);
-      // Return last known data on error instead of null
+      if (err.moduleOffline) {
+        // Extract module_udid from error if available
+        this.log('A module appears to be offline.');
+      }
       if (this._lastZonesData) {
         this.log('Returning last known zones data after error');
         return this._lastZonesData;
@@ -161,22 +389,17 @@ class TechApp extends Homey.App {
     }
   }
 
-  async onPoll() {
-    // Skip polling if a write operation is in progress
-    if (this._isWriting) {
-      this.log('!!! Polling skipped - write operation in progress');
-      const nextPoll = Number(this.pollInterval * 1000);
-      this.timerID = this.homey.setTimeout(this.onPoll, nextPoll);
-      return;
-    }
+  // ──────────────────────────────────────────────────────────────
+  // Polling
+  // ──────────────────────────────────────────────────────────────
 
+  async onPoll() {
     this.timerProcessing = true;
     this.log('!!! Polling started...');
 
     try {
-      // Force refresh zones from API once at the start of polling
       const zones = await this.getZones(true);
-      
+
       if (!zones) {
         this.log('!!! Polling aborted - no zones data');
         return;
@@ -187,15 +410,17 @@ class TechApp extends Homey.App {
         const devices = driver.getDevices();
         for (const device of devices) {
           if (device.__updateDeviceFromCache) {
-            // Use new method that reads from cache only (no API calls)
             await device.__updateDeviceFromCache(zones);
           } else if (device.__updateDevice) {
-            // Fallback to old method
             await device.__updateDevice();
           }
         }
       }
       this.log('!!! Polling ended.');
+
+      // After a successful poll, retry any pending writes
+      // (modules may have come back online)
+      this.retryPendingWrites();
     } catch (err) {
       this.log(`Polling error: ${err.message}`);
     }
@@ -206,66 +431,20 @@ class TechApp extends Homey.App {
     this.timerProcessing = false;
   }
 
-  async setZone({
-    module_udid,
-    mode_id,
-    mode_parent_id,
-    target_temperature,
-  }) {
-    // Set write lock to prevent race conditions with polling
-    this._isWriting = true;
-    
-    try {
-      const cachedZones = this.cache.get('Zones') || this._lastZonesData;
-      let currentScheduleIndex = 0;
+  // ──────────────────────────────────────────────────────────────
+  // setZone — now delegates to write queue
+  // ──────────────────────────────────────────────────────────────
 
-      if (cachedZones) {
-        const zoneToUpdate = cachedZones.find(
-          zone => zone.module_udid === module_udid && zone.zone.id === mode_parent_id
-        );
-        if (zoneToUpdate) {
-          if (typeof zoneToUpdate.mode.scheduleIndex !== 'undefined') {
-            currentScheduleIndex = zoneToUpdate.mode.scheduleIndex;
-          }
-          // Update both cache and backup
-          zoneToUpdate.zone.setTemperature = target_temperature * 10;
-          zoneToUpdate.mode.setTemperature = target_temperature * 10;
-          this.cache.set('Zones', cachedZones);
-          this._lastZonesData = cachedZones;
-          this.log(`Updated cached temperature for zone ${mode_parent_id} (${zoneToUpdate.description.name}) to ${target_temperature}`);
-        }
-      }
-
-      const success = await this._call({
-        method: 'post',
-        path: `/users/${this.user_id}/modules/${module_udid}/zones`,
-        json: {
-          mode: {
-            id: mode_id,
-            parentId: mode_parent_id,
-            mode: 'constantTemp',
-            constTempTime: 0,
-            setTemperature: target_temperature * 10,
-            scheduleIndex: currentScheduleIndex,
-          },
-        },
-      });
-
-      // Reduced delay - just enough for API to process
-      await this.delay(1000);
-
-      // Don't force refresh here - trust our cache update
-      // The next poll cycle will pick up any discrepancies
-      
-      return success;
-    } catch (err) {
-      this.log(`Got error when modifying zone: ${err.message}`);
-      return null;
-    } finally {
-      // Always release the write lock
-      this._isWriting = false;
-    }
+  async setZone({ module_udid, mode_id, mode_parent_id, target_temperature }) {
+    this.enqueueWrite({ module_udid, mode_id, mode_parent_id, target_temperature });
+    // Return immediately — the queue processes asynchronously.
+    // The caller (device.js) doesn't need to wait for the API call.
+    return true;
   }
+
+  // ──────────────────────────────────────────────────────────────
+  // Device readiness
+  // ──────────────────────────────────────────────────────────────
 
   async waitForDevicesReady() {
     this.log('Waiting for drivers and devices to be ready...');
@@ -280,7 +459,6 @@ class TechApp extends Homey.App {
 
       for (const driver of Object.values(drivers)) {
         readinessPromises.push(driver.read());
-
         const devices = driver.getDevices();
         for (const device of devices) {
           readinessPromises.push(device.ready());
@@ -296,7 +474,7 @@ class TechApp extends Homey.App {
 
       if (!allReady) {
         this.log(`Drivers or devices not ready, retrying... (${retryCount + 1}/${maxRetries})`);
-        await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds before retrying
+        await new Promise(resolve => setTimeout(resolve, 10000));
         retryCount++;
       }
     }
@@ -308,6 +486,10 @@ class TechApp extends Homey.App {
     }
   }
 
+  // ──────────────────────────────────────────────────────────────
+  // Auth
+  // ──────────────────────────────────────────────────────────────
+
   async refreshToken() {
     try {
       this.log('Refreshing eModul API token and user_id');
@@ -318,6 +500,7 @@ class TechApp extends Homey.App {
           username: this.username,
           password: this.password,
         },
+        maxRetries: 5,
       });
 
       this.token = response.token;
@@ -330,31 +513,28 @@ class TechApp extends Homey.App {
     }
   }
 
+  // ──────────────────────────────────────────────────────────────
+  // API client — bounded retries, no infinite loops
+  // ──────────────────────────────────────────────────────────────
+
   /**
-   * API helper method to make HTTP requests with retry and backoff logic.
-   * 
-   * Retry behavior:
-   * - Auth errors (401/403): Limited retries (5), then fail
-   * - Server errors (5xx): Unlimited retries with capped backoff
-   * - Network errors: Unlimited retries with capped backoff
-   * - Client errors (4xx): No retry, fail immediately
-   * 
-   * Backoff: Starts at 10s, doubles each retry, caps at 5 minutes.
-   * Resets to initial value on success.
-   * 
-   * @param {Object} params - The request parameters.
-   * @param {string} params.method - HTTP method (e.g., 'get', 'post').
-   * @param {string} params.path - API endpoint path.
-   * @param {Object} [params.body] - Request body as a string.
-   * @param {Object} [params.json] - Request body as a JSON object.
-   * @returns {Object} - The JSON response from the API.
+   * API helper method with bounded retry logic.
+   *
+   * @param {Object} params
+   * @param {string} params.method - HTTP method
+   * @param {string} params.path - API endpoint path
+   * @param {Object} [params.json] - Request body as JSON
+   * @param {Object} [params.body] - Request body as string
+   * @param {number} [params.maxRetries=3] - Max retry attempts
+   * @returns {Object} JSON response
+   * @throws {Error} with .moduleOffline=true if 503 "No module connection"
    */
-  async _call({ method = 'get', path = '/', body, json }) {
+  async _call({ method = 'get', path = '/', body, json, maxRetries = 3 }) {
     const url = `https://emodul.eu/api/v1${path}`;
     const opts = {
       method: method.toUpperCase(),
       headers: {},
-      timeout: 15000, // 15 second timeout
+      timeout: 15000,
     };
 
     if (this.token) {
@@ -370,19 +550,14 @@ class TechApp extends Homey.App {
       opts.headers['Content-Type'] = 'application/json';
     }
 
-    const maxAuthRetries = 5;          // Limited retries for auth errors
-    const initialBackoff = 10000;      // 10 seconds
-    const maxBackoff = 300000;         // 5 minutes cap
-    
-    let authAttempt = 0;
-    
-    // Use instance-level backoff so it persists across calls during outage
-    // but resets on success
-    if (!this._currentBackoff) {
-      this._currentBackoff = initialBackoff;
-    }
+    const initialBackoff = 5000;   // 5s
+    const maxBackoff = 60000;      // 1 min cap
+    let backoff = initialBackoff;
+    let attempt = 0;
+    let authRetries = 0;
+    const maxAuthRetries = 3;
 
-    while (true) {
+    while (attempt <= maxRetries) {
       try {
         this.log(`[API] → ${method.toUpperCase()} ${path}`);
         const startTime = Date.now();
@@ -391,81 +566,83 @@ class TechApp extends Homey.App {
 
         if (res.ok) {
           this.log(`[API] ← ${res.status} OK (${elapsed}ms)`);
-          // Success! Reset backoff for future calls
-          this._currentBackoff = initialBackoff;
-          const resJson = await res.json();
-          return resJson;
+          return await res.json();
         }
 
-        // Log error response for debugging
+        // Read error response
         let responseBody = '';
         try {
           responseBody = await res.text();
         } catch (e) {
           responseBody = '(unable to read response body)';
         }
-        
-        const err = new Error(`API error occurred: response status is ${res.status}`);
-        err.code = res.status;
+
         this.error(`[API] ← ${res.status} on ${method.toUpperCase()} ${path} (${elapsed}ms)`);
         this.error(`[API] Response: ${responseBody.substring(0, 500)}`);
 
-        if (res.status === 401 || res.status === 403) {
-          // Auth errors - limited retries
-          if (authAttempt >= maxAuthRetries) {
-            throw new Error('Max retries reached. Authorization failed.');
-          }
+        // 503 with "No module connection" — don't retry, signal to caller
+        if (res.status === 503 && responseBody.includes('No module connection')) {
+          const err = new Error(`Module offline (503): ${responseBody.substring(0, 200)}`);
+          err.code = 503;
+          err.moduleOffline = true;
+          throw err;
+        }
 
-          this.log(`Attempting to refresh token... (${authAttempt + 1}/${maxAuthRetries})`);
+        // Auth errors — try refreshing token
+        if ((res.status === 401 || res.status === 403) && authRetries < maxAuthRetries) {
+          authRetries++;
+          this.log(`Auth error. Refreshing token... (${authRetries}/${maxAuthRetries})`);
           this.token = '';
           const refreshed = await this.refreshToken();
-
-          if (!refreshed) {
-            throw new Error('Failed to refresh token.');
+          if (refreshed) {
+            opts.headers['Authorization'] = `Bearer ${this.token}`;
+            continue; // Don't count as regular retry
           }
-
-          opts.headers['Authorization'] = `Bearer ${this.token}`;
-          authAttempt++;
-          
-          await this.delay(this._currentBackoff);
-          this._currentBackoff = Math.min(this._currentBackoff * 2, maxBackoff);
-          continue;
-          
-        } else if (res.status >= 500 && res.status < 600) {
-          // Server errors - unlimited retries with capped backoff
-          this.log(`Server error ${res.status}. Retrying in ${this._currentBackoff / 1000}s...`);
-          
-          await this.delay(this._currentBackoff);
-          this._currentBackoff = Math.min(this._currentBackoff * 2, maxBackoff);
-          continue;
-          
-        } else {
-          // Client errors (4xx other than auth) - do not retry
-          throw err;
         }
+
+        // Server errors (5xx) — retry with backoff
+        if (res.status >= 500 && res.status < 600) {
+          attempt++;
+          if (attempt <= maxRetries) {
+            this.log(`Server error ${res.status}. Retry ${attempt}/${maxRetries} in ${backoff / 1000}s...`);
+            await this.delay(backoff);
+            backoff = Math.min(backoff * 2, maxBackoff);
+            continue;
+          }
+        }
+
+        // Client errors or max retries exceeded
+        const err = new Error(`API error: ${res.status} on ${method.toUpperCase()} ${path}`);
+        err.code = res.status;
+        throw err;
+
       } catch (err) {
-        // Network errors - unlimited retries with capped backoff
-        if (err.code && err.code >= 400 && err.code < 500) {
-          // Re-throw client errors (already handled above, but just in case)
+        // Re-throw known errors (module offline, client errors)
+        if (err.moduleOffline || (err.code && err.code >= 400 && err.code < 500)) {
           throw err;
         }
 
-        if (err.type === 'request-timeout' || err.name === 'AbortError') {
-          this.error(`[API] Timeout on ${method.toUpperCase()} ${path}`);
+        // Network/timeout errors
+        attempt++;
+        if (attempt <= maxRetries) {
+          if (err.type === 'request-timeout' || err.name === 'AbortError') {
+            this.error(`[API] Timeout on ${method.toUpperCase()} ${path}`);
+          }
+          this.log(`[API] Network error: ${err.message}. Retry ${attempt}/${maxRetries} in ${backoff / 1000}s...`);
+          await this.delay(backoff);
+          backoff = Math.min(backoff * 2, maxBackoff);
+          continue;
         }
-        
-        this.log(`[API] Network error: ${err.message}. Retrying in ${this._currentBackoff / 1000}s...`);
-        
-        await this.delay(this._currentBackoff);
-        this._currentBackoff = Math.min(this._currentBackoff * 2, maxBackoff);
+
+        throw err;
       }
     }
+
+    throw new Error(`Max retries (${maxRetries}) exceeded for ${method.toUpperCase()} ${path}`);
   }
 
   /**
    * Delay helper method.
-   * @param {number} ms - Milliseconds to delay.
-   * @returns {Promise} - Resolves after the specified delay.
    */
   delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
