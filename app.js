@@ -100,6 +100,12 @@ class TechApp extends Homey.App {
 
     this._consoleReEnabled = false;
 
+    // Restore original log/error if we previously wrapped them
+    if (this._originalLog) {
+      this.log = this._originalLog;
+      this.error = this._originalError;
+    }
+
     if (enabled && channel) {
       try {
         consolere.connect({
@@ -108,16 +114,29 @@ class TechApp extends Homey.App {
         });
         this._consoleReEnabled = true;
         this._consoleReChannel = channel;
-        this.log(`[ConsoleRe] Connecting to channel: ${channel}`);
-        // Send a test message after a short delay to allow socket.io to connect
-        setTimeout(() => {
-          this.rlog('🚀 console.re logging connected for Tech Controllers');
-        }, 3000);
+
+        // Wrap this.log and this.error to mirror everything to console.re
+        this._originalLog = this.log.bind(this);
+        this._originalError = this.error.bind(this);
+
+        const self = this;
+        this.log = function (...args) {
+          self._originalLog(...args);
+          if (console.re && console.re.log) {
+            try { console.re.log('[TechApp]', ...args); } catch (e) { /* ignore */ }
+          }
+        };
+        this.error = function (...args) {
+          self._originalError(...args);
+          if (console.re && console.re.error) {
+            try { console.re.error('[TechApp]', ...args); } catch (e) { /* ignore */ }
+          }
+        };
+
+        this._originalLog(`[ConsoleRe] Connected to channel: ${channel}`);
       } catch (e) {
         this.log(`[ConsoleRe] Failed to connect: ${e.message}`);
       }
-    } else {
-      this.log('[ConsoleRe] Disabled');
     }
   }
 
