@@ -3,6 +3,7 @@
 const Homey = require('homey');
 const fetch = require('node-fetch');
 const Cache = require('node-cache');
+const consolere = require('console-remote-client');
 
 class TechApp extends Homey.App {
 
@@ -41,6 +42,9 @@ class TechApp extends Homey.App {
     // API backoff state (shared across all calls)
     this._currentBackoff = 10000; // 10s initial
 
+    // console.re remote logging
+    this._initConsoleRe();
+
     this.homey.settings.on('set', async key => {
       this.log(`App setting changed: ${key}`);
 
@@ -59,6 +63,10 @@ class TechApp extends Homey.App {
         this.log(`Polling interval updated to ${this.pollInterval}s (TTL: ${newTTL}s)`);
         this._restartPolling();
       }
+
+      if (key === 'consolere_enabled' || key === 'consolere_channel') {
+        this._initConsoleRe();
+      }
     });
 
     // Let's make sure we have a fresh token.
@@ -74,6 +82,54 @@ class TechApp extends Homey.App {
     this.timerID = this.homey.setTimeout(this.onPoll, 10000);
 
     this.log('App finished init');
+    this.rlog('App initialized. Polling interval:', this.pollInterval, 's');
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // console.re remote logging
+  // ──────────────────────────────────────────────────────────────
+
+  _initConsoleRe() {
+    const enabled = this.homey.settings.get('consolere_enabled') === true;
+    const channel = this.homey.settings.get('consolere_channel');
+
+    if (enabled && channel) {
+      consolere.connect({
+        channel: channel,
+        server: 'https://console.re',
+      });
+      this._consoleReEnabled = true;
+      this.log(`[ConsoleRe] Connected to channel: ${channel}`);
+    } else {
+      this._consoleReEnabled = false;
+    }
+  }
+
+  /**
+   * Send a log message to console.re (if enabled).
+   * Call this alongside this.log() for important events.
+   */
+  rlog(...args) {
+    if (this._consoleReEnabled) {
+      try {
+        console.re.log('[TechApp]', ...args);
+      } catch (e) {
+        // Silently ignore console.re errors
+      }
+    }
+  }
+
+  /**
+   * Send an error message to console.re (if enabled).
+   */
+  rerror(...args) {
+    if (this._consoleReEnabled) {
+      try {
+        console.re.error('[TechApp]', ...args);
+      } catch (e) {
+        // Silently ignore console.re errors
+      }
+    }
   }
 
   _restartPolling() {
@@ -138,6 +194,7 @@ class TechApp extends Homey.App {
     });
 
     this.log(`[WriteQueue] Enqueued zone ${mode_parent_id} → ${target_temperature}° (module ${module_udid.substring(0, 8)}…, queue size: ${queue.pending.size})`);
+    this.rlog(`📝 Enqueued zone ${mode_parent_id} → ${target_temperature}° (queue: ${queue.pending.size})`);
 
     // Update cache immediately so Homey UI reflects the change
     this._updateCachedTemperature(module_udid, mode_parent_id, target_temperature);
@@ -179,6 +236,7 @@ class TechApp extends Homey.App {
               this._moduleOnline[module_udid] = true;
               recovered = true;
               this.log(`[WriteQueue] Module ${module_udid.substring(0, 8)}… is back online!`);
+              this.rlog(`🟢 Module ${module_udid.substring(0, 8)}… is back online!`);
               break;
             } catch (err) {
               this.log(`[WriteQueue] Module still offline: ${err.message}`);
@@ -249,12 +307,14 @@ class TechApp extends Homey.App {
           });
 
           this.log(`[WriteQueue] ✓ Zone ${zone_id} set to ${writeReq.target_temperature}°`);
+          this.rlog(`✅ Zone ${zone_id} set to ${writeReq.target_temperature}°`);
           this._moduleOnline[module_udid] = true;
 
           // Small delay between writes to the same module
           await this.delay(2000);
         } catch (err) {
           this.error(`[WriteQueue] ✗ Failed zone ${zone_id}: ${err.message}`);
+          this.rerror(`❌ Failed zone ${zone_id}: ${err.message}`);
 
           // If module is offline (503), mark it and stop processing
           if (err.moduleOffline) {
@@ -262,6 +322,7 @@ class TechApp extends Homey.App {
             // Re-queue this write
             queue.pending.set(zone_id, writeReq);
             this.log(`[WriteQueue] Module offline. Re-queued zone ${zone_id}. Will retry on next poll.`);
+            this.rerror(`🔌 Module ${module_udid.substring(0, 8)}… offline. Queued writes paused.`);
             break;
           }
 
@@ -360,6 +421,7 @@ class TechApp extends Homey.App {
               if (fallbackZone) {
                 allZones.push(fallbackZone);
                 this.log(`Zone ${zone.zone.id} has duringChange=true. Using cached data.`);
+                this.rlog(`⏳ Zone ${zone.zone.id} duringChange=true, using cache`);
               } else {
                 allZones.push(zone);
                 this.log(`Zone ${zone.zone.id} has duringChange=true but no fallback. Using API data.`);
@@ -585,6 +647,7 @@ class TechApp extends Homey.App {
           const err = new Error(`Module offline (503): ${responseBody.substring(0, 200)}`);
           err.code = 503;
           err.moduleOffline = true;
+          this.rerror(`🔌 503 Module offline: ${method.toUpperCase()} ${path}`);
           throw err;
         }
 

@@ -39,6 +39,20 @@
         </div>
       </fieldset>
 
+    <fieldset>
+      <legend>console.re Logging</legend>
+      <p>If you want to view live logs of the application, enable the switch and enter a unique log category. You can view the logs by visiting console.re/&lt;yourcategory&gt;. Don't forget to switch it off, once done.</p>
+
+      <div class="field row">
+        <label for="consolere_enabled">Enabled?</label>
+        <input id="consolere_enabled" type="checkbox" />
+      </div>
+      <div class="field row">
+        <label for="consolere_channel">Log category *</label>
+        <input id="consolere_channel" type="text" value="" placeholder="e.g. tech-controllers-myname" />
+      </div>
+    </fieldset>
+
     <button id="save" class="right">Save changes</button>
 
     <p id="saveMessage" style="display: none; color: green;">Changes saved successfully!</p>
@@ -52,6 +66,8 @@
         var usernameElement = document.getElementById("username");
         var passwordElement = document.getElementById("password");
         var cachettlElement = document.getElementById("cachettl");
+        var consolereEnabledElement = document.getElementById("consolere_enabled");
+        var consolereChannelElement = document.getElementById("consolere_channel");
         var saveElement = document.getElementById("save");
         var saveMessageElement = document.getElementById("saveMessage");
 
@@ -66,9 +82,19 @@
         });
 
         Homey.get("cachettl", function (err, cachettl) {
-            if (err) return Homey.alert(err);
-            cachettlElement.value = cachettl;
-          });
+          if (err) return Homey.alert(err);
+          cachettlElement.value = cachettl;
+        });
+
+        Homey.get("consolere_enabled", function (err, enabled) {
+          if (err) return Homey.alert(err);
+          consolereEnabledElement.checked = enabled === true;
+        });
+
+        Homey.get("consolere_channel", function (err, channel) {
+          if (err) return Homey.alert(err);
+          consolereChannelElement.value = channel || '';
+        });
 
         saveElement.addEventListener("click", function (e) {
           Homey.set("username", usernameElement.value, function (err) {
@@ -78,6 +104,12 @@
             if (err) return Homey.alert(err);
           });
           Homey.set("cachettl", cachettlElement.value, function (err) {
+            if (err) return Homey.alert(err);
+          });
+          Homey.set("consolere_enabled", consolereEnabledElement.checked, function (err) {
+            if (err) return Homey.alert(err);
+          });
+          Homey.set("consolere_channel", consolereChannelElement.value, function (err) {
             if (err) return Homey.alert(err);
           });
 
