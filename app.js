@@ -39,6 +39,11 @@ class TechApp extends Homey.App {
     this._lastZonesData = null;
     this._moduleOnline = {}; // Track module connectivity: module_udid -> boolean
 
+    // Persistent write store: survives queue processing cycles.
+    // Writes are NEVER dropped due to timeout — they persist until successfully applied
+    // or explicitly superseded by a newer value for the same zone.
+    this._persistentWrites = new Map(); // key: `${module_udid}:${zone_id}` → writeRequest
+
     // API backoff state (shared across all calls)
     this._currentBackoff = 10000; // 10s initial
 
@@ -148,20 +153,31 @@ class TechApp extends Homey.App {
   /**
    * Enqueue a zone write. Replaces any previous pending write for the same zone.
    * The queue processor will send only the latest value.
+   *
+   * Writes are stored in both the per-module queue (for immediate processing)
+   * and the persistent store (to survive processing cycles and module outages).
+   * A write is only removed from persistent store after confirmed success.
    */
   enqueueWrite({ module_udid, mode_id, mode_parent_id, target_temperature }) {
     const queue = this._getWriteQueue(module_udid);
-
-    // Always replace — latest value wins
-    queue.pending.set(mode_parent_id, {
+    const writeReq = {
       module_udid,
       mode_id,
       mode_parent_id,
       target_temperature,
       timestamp: Date.now(),
-    });
+      retryCount: 0,
+    };
 
-    this.log(`[WriteQueue] Enqueued zone ${mode_parent_id} → ${target_temperature}° (module ${module_udid.substring(0, 8)}…, queue size: ${queue.pending.size})`);
+    // Always replace — latest value wins
+    queue.pending.set(mode_parent_id, writeReq);
+
+    // Also store persistently — this is the safety net.
+    // Keyed by module+zone so newer values naturally supersede older ones.
+    const persistKey = `${module_udid}:${mode_parent_id}`;
+    this._persistentWrites.set(persistKey, writeReq);
+
+    this.log(`[WriteQueue] Enqueued zone ${mode_parent_id} → ${target_temperature}° (module ${module_udid.substring(0, 8)}…, queue size: ${queue.pending.size}, persistent: ${this._persistentWrites.size})`);
     this.rlog(`📝 Enqueued zone ${mode_parent_id} → ${target_temperature}° (queue: ${queue.pending.size})`);
 
     // Update cache immediately so Homey UI reflects the change
@@ -176,6 +192,11 @@ class TechApp extends Homey.App {
   /**
    * Process the write queue for a module. Sends one write at a time.
    * Waits for duringChange to clear before sending the next one.
+   *
+   * IMPORTANT: Writes are NEVER dropped. If the module is offline, the queue
+   * processor exits and writes remain in the persistent store. The next poll
+   * cycle will re-hydrate the queue and retry. This ensures that temperature
+   * changes are eventually applied, even if the module is offline for hours.
    */
   async _processWriteQueue(module_udid) {
     const queue = this._getWriteQueue(module_udid);
@@ -186,34 +207,13 @@ class TechApp extends Homey.App {
 
     try {
       while (queue.pending.size > 0) {
-        // Check if module is known to be offline
+        // If module is known offline, don't block — just exit.
+        // Writes stay in persistent store and will be retried on the next
+        // poll cycle when the module comes back.
         if (this._moduleOnline[module_udid] === false) {
-          this.log(`[WriteQueue] Module ${module_udid.substring(0, 8)}… is offline. Waiting for recovery before writing...`);
-          // Wait up to 5 minutes, checking every 30s
-          const offlineDeadline = Date.now() + 5 * 60 * 1000;
-          let recovered = false;
-          while (Date.now() < offlineDeadline && queue.pending.size > 0) {
-            await this.delay(30000);
-            // Try a lightweight check — just GET the module
-            try {
-              await this._call({
-                method: 'get',
-                path: `/users/${this.user_id}/modules/${module_udid}`,
-                maxRetries: 1,
-              });
-              this._moduleOnline[module_udid] = true;
-              recovered = true;
-              this.log(`[WriteQueue] Module ${module_udid.substring(0, 8)}… is back online!`);
-              this.rlog(`🟢 Module ${module_udid.substring(0, 8)}… is back online!`);
-              break;
-            } catch (err) {
-              this.log(`[WriteQueue] Module still offline: ${err.message}`);
-            }
-          }
-          if (!recovered) {
-            this.log(`[WriteQueue] Module ${module_udid.substring(0, 8)}… still offline after 5 min. Writes remain queued for next poll cycle.`);
-            break; // Exit loop, writes stay in queue
-          }
+          this.log(`[WriteQueue] Module ${module_udid.substring(0, 8)}… is offline. ${queue.pending.size} writes retained in persistent store. Will retry on next poll.`);
+          this.rlog(`🔌 Module ${module_udid.substring(0, 8)}… offline. ${queue.pending.size} writes waiting.`);
+          break;
         }
 
         // Pick the next write (oldest first, but since we dedup by zone, order is just insertion)
@@ -240,7 +240,8 @@ class TechApp extends Homey.App {
           continue;
         }
 
-        // Remove from pending before attempting (we'll re-queue on failure)
+        // Remove from pending queue before attempting.
+        // The write is still safe in _persistentWrites — it will be re-queued on failure.
         queue.pending.delete(zone_id);
 
         // Get current scheduleIndex from cache
@@ -255,10 +256,11 @@ class TechApp extends Homey.App {
           }
         }
 
-        // Attempt the write — single attempt, no infinite retry in _call
+        // Attempt the write
         try {
-          this.log(`[WriteQueue] Writing zone ${zone_id} → ${writeReq.target_temperature}°`);
-          this.rlog(`✏️ Writing zone ${zone_id} → ${writeReq.target_temperature}°`);
+          writeReq.retryCount = (writeReq.retryCount || 0) + 1;
+          this.log(`[WriteQueue] Writing zone ${zone_id} → ${writeReq.target_temperature}° (attempt ${writeReq.retryCount})`);
+          this.rlog(`✏️ Writing zone ${zone_id} → ${writeReq.target_temperature}° (attempt ${writeReq.retryCount})`);
           await this._call({
             method: 'post',
             path: `/users/${this.user_id}/modules/${module_udid}/zones`,
@@ -275,50 +277,129 @@ class TechApp extends Homey.App {
             maxRetries: 3, // Limited retries per write attempt
           });
 
-          this.log(`[WriteQueue] ✓ Zone ${zone_id} set to ${writeReq.target_temperature}°`);
-          this.rlog(`✅ Zone ${zone_id} set to ${writeReq.target_temperature}°`);
+          this.log(`[WriteQueue] ✓ Zone ${zone_id} set to ${writeReq.target_temperature}° (after ${writeReq.retryCount} attempt(s))`);
+          this.rlog(`✅ Zone ${zone_id} set to ${writeReq.target_temperature}° (attempt ${writeReq.retryCount})`);
           this._moduleOnline[module_udid] = true;
+
+          // SUCCESS — remove from persistent store
+          const persistKey = `${module_udid}:${zone_id}`;
+          this._persistentWrites.delete(persistKey);
 
           // Small delay between writes to the same module
           await this.delay(2000);
         } catch (err) {
-          this.error(`[WriteQueue] ✗ Failed zone ${zone_id}: ${err.message}`);
-          this.rerror(`❌ Failed zone ${zone_id}: ${err.message}`);
+          this.error(`[WriteQueue] ✗ Failed zone ${zone_id}: ${err.message} (attempt ${writeReq.retryCount})`);
+          this.rerror(`❌ Failed zone ${zone_id}: ${err.message} (attempt ${writeReq.retryCount})`);
 
-          // If module is offline (503), mark it and stop processing
+          // Write stays in _persistentWrites regardless of error type.
+          // It will be re-hydrated into the queue on the next poll cycle.
+
           if (err.moduleOffline) {
             this._moduleOnline[module_udid] = false;
-            // Re-queue this write
+            // Re-add to pending queue so retryPendingWrites picks it up
             queue.pending.set(zone_id, writeReq);
-            this.log(`[WriteQueue] Module offline. Re-queued zone ${zone_id}. Will retry on next poll.`);
-            this.rerror(`🔌 Module ${module_udid.substring(0, 8)}… offline. Queued writes paused.`);
-            break;
+            this.log(`[WriteQueue] Module offline. Zone ${zone_id} write retained (attempt ${writeReq.retryCount}). Will retry when module recovers.`);
+            this.rerror(`🔌 Module ${module_udid.substring(0, 8)}… offline. ${queue.pending.size} writes waiting for recovery.`);
+            break; // Stop processing this module's queue
           }
 
-          // For other errors, re-queue if within 15 min of original request
-          if (Date.now() - writeReq.timestamp < 15 * 60 * 1000) {
-            queue.pending.set(zone_id, writeReq);
-            this.log(`[WriteQueue] Re-queued zone ${zone_id} for retry.`);
-            await this.delay(10000);
-          } else {
-            this.error(`[WriteQueue] Giving up on zone ${zone_id} → ${writeReq.target_temperature}° (15 min timeout)`);
-          }
+          // For other errors (timeouts, server errors), re-add to queue with backoff
+          queue.pending.set(zone_id, writeReq);
+          const backoff = Math.min(10000 * Math.pow(1.5, Math.min(writeReq.retryCount, 10)), 120000); // 10s → 15s → 22s ... max 2min
+          this.log(`[WriteQueue] Re-queued zone ${zone_id}. Next attempt in ${Math.round(backoff / 1000)}s (attempt ${writeReq.retryCount})`);
+          await this.delay(backoff);
         }
       }
     } finally {
       queue.processing = false;
-      this.log(`[WriteQueue] Processing ended for module ${module_udid.substring(0, 8)}… (${queue.pending.size} pending)`);
+      const persistCount = this._countPersistentWritesForModule(module_udid);
+      this.log(`[WriteQueue] Processing ended for module ${module_udid.substring(0, 8)}… (${queue.pending.size} queued, ${persistCount} persistent)`);
     }
   }
 
   /**
+   * Count persistent writes for a specific module.
+   */
+  _countPersistentWritesForModule(module_udid) {
+    let count = 0;
+    for (const [key] of this._persistentWrites) {
+      if (key.startsWith(module_udid + ':')) count++;
+    }
+    return count;
+  }
+
+  /**
    * Retry pending writes for all modules. Called after successful polls.
+   *
+   * Re-hydrates the per-module queues from the persistent store, ensuring
+   * that writes are never lost even if the queue processor exited due to
+   * module offline or other transient errors.
    */
   retryPendingWrites() {
+    // Re-hydrate queues from persistent store.
+    // This catches writes that survived a queue processing cycle exit.
+    for (const [persistKey, writeReq] of this._persistentWrites) {
+      const { module_udid, mode_parent_id: zone_id } = writeReq;
+      const queue = this._getWriteQueue(module_udid);
+
+      // Only re-add if not already in the pending queue
+      if (!queue.pending.has(zone_id)) {
+        queue.pending.set(zone_id, writeReq);
+        this.log(`[WriteQueue] Re-hydrated zone ${zone_id} from persistent store (attempt ${writeReq.retryCount || 0})`);
+      }
+    }
+
+    // Now kick off processing for any module that has pending writes and is online
     for (const [module_udid, queue] of Object.entries(this._writeQueues)) {
-      if (queue.pending.size > 0 && !queue.processing && this._moduleOnline[module_udid] !== false) {
-        this.log(`[WriteQueue] Retrying ${queue.pending.size} pending writes for module ${module_udid.substring(0, 8)}…`);
+      if (queue.pending.size > 0 && !queue.processing) {
+        // If module was offline but poll just succeeded (meaning getZones worked),
+        // the module might be back. Reset the offline flag optimistically —
+        // _processWriteQueue will re-mark offline if the write actually fails with 503.
+        if (this._moduleOnline[module_udid] === false) {
+          this.log(`[WriteQueue] Module ${module_udid.substring(0, 8)}… was offline but poll succeeded. Retrying ${queue.pending.size} writes...`);
+          this.rlog(`🔄 Module ${module_udid.substring(0, 8)}… may be back. Retrying ${queue.pending.size} writes...`);
+          this._moduleOnline[module_udid] = true; // Optimistic reset
+        }
         this._processWriteQueue(module_udid);
+      }
+    }
+
+    // Log persistent store status
+    if (this._persistentWrites.size > 0) {
+      this.log(`[WriteQueue] Persistent store: ${this._persistentWrites.size} write(s) awaiting confirmation`);
+    }
+  }
+
+  /**
+   * Verify persistent writes against actual module state.
+   * Called after a successful poll to check if writes were applied
+   * (e.g. confirmed by reading back the temperature from the module).
+   */
+  verifyPersistentWrites(zones) {
+    if (!zones || this._persistentWrites.size === 0) return;
+
+    for (const [persistKey, writeReq] of this._persistentWrites) {
+      const { module_udid, mode_parent_id: zone_id, target_temperature } = writeReq;
+
+      const zoneData = zones.find(
+        z => z.module_udid === module_udid && z.zone.id === zone_id
+      );
+
+      if (!zoneData) continue;
+
+      // If the module reports the target temperature we wanted, the write was applied
+      const actualTemp = zoneData.zone.setTemperature / 10;
+      if (actualTemp === target_temperature && !zoneData.zone.duringChange) {
+        this.log(`[WriteQueue] ✓ Verified: zone ${zone_id} confirmed at ${target_temperature}° — removing from persistent store`);
+        this.rlog(`✔️ Verified zone ${zone_id} at ${target_temperature}°`);
+        this._persistentWrites.delete(persistKey);
+
+        // Also clean from the pending queue if still there
+        const queue = this._getWriteQueue(module_udid);
+        const pending = queue.pending.get(zone_id);
+        if (pending && pending.timestamp === writeReq.timestamp) {
+          queue.pending.delete(zone_id);
+        }
       }
     }
   }
@@ -452,6 +533,9 @@ class TechApp extends Homey.App {
       }
       this.log('!!! Polling ended.');
       this.rlog(`✔️ Polling ended. ${zones.length} zones`);
+
+      // Verify if any persistent writes have been confirmed by the module
+      this.verifyPersistentWrites(zones);
 
       // After a successful poll, retry any pending writes
       // (modules may have come back online)
