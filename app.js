@@ -37,6 +37,7 @@ class TechApp extends Homey.App {
     // Key: module_udid, Value: { pending: Map<zone_id, writeRequest>, processing: boolean }
     this._writeQueues = {};
     this._lastZonesData = null;
+    this._lastRawZonesData = null; // Unmodified API data (no duringChange fallback)
     this._moduleOnline = {}; // Track module connectivity: module_udid -> boolean
 
     // Persistent write store: survives queue processing cycles.
@@ -141,10 +142,14 @@ class TechApp extends Homey.App {
   }
 
   /**
-   * Check if a specific zone has duringChange=true in cached data.
+   * Check if a specific zone has duringChange=true.
+   * Uses raw API data (not the fallback/cached data used for UI), because
+   * the fallback deliberately replaces duringChange zones with old cached
+   * entries that have duringChange=false — which would make this check
+   * always return false and cause the queue to fire writes prematurely.
    */
   _isZoneChanging(module_udid, zone_id) {
-    const zones = this._lastZonesData;
+    const zones = this._lastRawZonesData;
     if (!zones) return false;
     const zone = zones.find(z => z.zone.id === zone_id && z.module_udid === module_udid);
     return zone?.zone?.duringChange === true;
@@ -374,23 +379,36 @@ class TechApp extends Homey.App {
    * Verify persistent writes against actual module state.
    * Called after a successful poll to check if writes were applied
    * (e.g. confirmed by reading back the temperature from the module).
+   *
+   * IMPORTANT: We verify against _lastRawZonesData (the unmodified API response),
+   * NOT the processed zones array (which may contain cached/fallback data when
+   * duringChange=true). This prevents false confirmations where the cached
+   * temperature matches the target but the module hasn't actually applied it yet.
    */
-  verifyPersistentWrites(zones) {
-    if (!zones || this._persistentWrites.size === 0) return;
+  verifyPersistentWrites() {
+    if (!this._lastRawZonesData || this._persistentWrites.size === 0) return;
 
     for (const [persistKey, writeReq] of this._persistentWrites) {
       const { module_udid, mode_parent_id: zone_id, target_temperature } = writeReq;
 
-      const zoneData = zones.find(
+      // Use RAW API data — not the cached/fallback data from getZones()
+      const zoneData = this._lastRawZonesData.find(
         z => z.module_udid === module_udid && z.zone.id === zone_id
       );
 
       if (!zoneData) continue;
 
+      // Zone must NOT be mid-transition — duringChange means the module is still
+      // applying a previous change and the reported temperature is unreliable.
+      if (zoneData.zone.duringChange) {
+        this.log(`[WriteQueue] Zone ${zone_id} still duringChange — cannot verify yet`);
+        continue;
+      }
+
       // If the module reports the target temperature we wanted, the write was applied
       const actualTemp = zoneData.zone.setTemperature / 10;
-      if (actualTemp === target_temperature && !zoneData.zone.duringChange) {
-        this.log(`[WriteQueue] ✓ Verified: zone ${zone_id} confirmed at ${target_temperature}° — removing from persistent store`);
+      if (actualTemp === target_temperature) {
+        this.log(`[WriteQueue] ✓ Verified: zone ${zone_id} confirmed at ${target_temperature}° (raw API) — removing from persistent store`);
         this.rlog(`✔️ Verified zone ${zone_id} at ${target_temperature}°`);
         this._persistentWrites.delete(persistKey);
 
@@ -441,7 +459,8 @@ class TechApp extends Homey.App {
         maxRetries: 3,
       });
 
-      const allZones = [];
+      const allZones = [];     // Processed zones (with duringChange fallback for UI)
+      const allRawZones = [];  // Raw API zones (unmodified, for write verification)
       const fallbackZones = this._lastZonesData || cachedZones;
 
       for (const module of modules) {
@@ -462,17 +481,21 @@ class TechApp extends Homey.App {
           if (zone && zone.zone.zoneState !== 'zoneOff') {
             zone.module_udid = module.udid;
 
+            // Always store the raw API data (for write verification)
+            allRawZones.push(zone);
+
             if (zone.zone.duringChange) {
               // Zone is currently applying a change — use fallback data to avoid
-              // overwriting Homey's UI with stale mid-transition values
+              // overwriting Homey's UI with stale mid-transition values.
+              // But ONLY for the UI-facing data; raw data is stored separately.
               const fallbackZone = fallbackZones?.find(
                 cached => cached.zone.id === zone.zone.id &&
                          cached.module_udid === module.udid
               );
               if (fallbackZone) {
                 allZones.push(fallbackZone);
-                this.log(`Zone ${zone.zone.id} has duringChange=true. Using cached data.`);
-                this.rlog(`⏳ Zone ${zone.zone.id} duringChange=true, using cache`);
+                this.log(`Zone ${zone.zone.id} has duringChange=true. Using cached data for UI.`);
+                this.rlog(`⏳ Zone ${zone.zone.id} duringChange=true, using cache for UI`);
               } else {
                 allZones.push(zone);
                 this.log(`Zone ${zone.zone.id} has duringChange=true but no fallback. Using API data.`);
@@ -486,6 +509,7 @@ class TechApp extends Homey.App {
 
       this.cache.set('Zones', allZones);
       this._lastZonesData = allZones;
+      this._lastRawZonesData = allRawZones; // Unmodified API data for verifyPersistentWrites
 
       return allZones;
     } catch (err) {
@@ -535,7 +559,8 @@ class TechApp extends Homey.App {
       this.rlog(`✔️ Polling ended. ${zones.length} zones`);
 
       // Verify if any persistent writes have been confirmed by the module
-      this.verifyPersistentWrites(zones);
+      // (uses _lastRawZonesData internally, not the UI-facing zones)
+      this.verifyPersistentWrites();
 
       // After a successful poll, retry any pending writes
       // (modules may have come back online)
