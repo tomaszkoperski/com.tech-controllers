@@ -6,8 +6,9 @@
     "lint": "eslint --ext .js,.ts --ignore-path .gitignore ."
   },
   "dependencies": {
-    "node-fetch": "^2.6.1",
-    "node-cache": "^5.1.2"
+    "console-remote-client": "^2.1.18",
+    "node-cache": "^5.1.2",
+    "node-fetch": "^2.6.1"
   },
   "devDependencies": {
     "@tsconfig/node12": "^1.0.9",

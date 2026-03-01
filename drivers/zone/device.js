@@ -10,29 +10,19 @@ class Zone extends Device {
    * onInit is called when the device is initialized.
    */
   async onInit() {
-    this.log('Zone initialising');
-
-    this.log(`name: ${this.getName()}`);
-
     this.zone_id = this.getData().zone_id;
-    this.log(`zone_id: ${this.zone_id}`);
-
     this.mode_id = this.getData().mode_id;
-    this.log(`mode_id: ${this.mode_id}`);
-
     this.zone_parent_id = this.getData().zone_parent_id;
-    this.log(`zone_parent_id: ${this.zone_parent_id}`);
-
     this.module_udid = this.getData().module_udid;
-    this.log(`module_udid: ${this.module_udid}`);
 
     // Track consecutive failures for availability management
     this._failureCount = 0;
-    this._maxFailures = 3;
+    this._maxFailures = 10; // High threshold — only mark unavailable after sustained failures
 
     this.registerCapabilityListener('target_temperature', async value => {
-      // set temperature
-      this.log(`Setting temperature in zone ${this.getName()} to: ${value}`);
+      this.log(`→ Set ${value}°`);
+
+      // Delegate to the app's write queue — returns immediately.
       await this.homey.app.setZone({
         module_udid: this.module_udid,
         mode_id: this.mode_id,
@@ -41,106 +31,129 @@ class Zone extends Device {
       });
     });
 
-    await this.__updateDevice();
-  }
-
-  /**
-   * onAdded is called when the user adds the device, called just after pairing.
-   */
-  async onAdded() {
-    this.log('Zone has been added');
-  }
-
-  /**
-   * onSettings is called when the user updates the device's settings.
-   * @param {object} event the onSettings event data
-   * @param {object} event.oldSettings The old settings object
-   * @param {object} event.newSettings The new settings object
-   * @param {string[]} event.changedKeys An array of keys changed since the previous version
-   * @returns {Promise<string|void>} return a custom message that will be displayed
-   */
-  async onSettings({
-    oldSettings,
-    newSettings,
-    changedKeys,
-  }) {
-    this.log('Zone settings where changed');
-    await this.__updateDevice();
-  }
-
-  /**
-   * onRenamed is called when the user updates the device's name.
-   * This method can be used this to synchronise the name to the device.
-   * @param {string} name The new name
-   */
-  async onRenamed(name) {
-    this.log('Zone was renamed');
-    await this.__updateDevice();
-  }
-
-  /**
-   * onDeleted is called when the user deleted the device.
-   */
-  async onDeleted() {
-    this.log('Zone has been deleted');
-  }
-
-  async __updateDevice() {
+    // Don't let a failed initial update prevent device from becoming ready.
+    // Polling will catch up with correct values on the next cycle.
     try {
-      const zones = await this.homey.app.getZones();
+      await this.__updateDevice();
+    } catch (err) {
+      this.error(`Init update failed (non-fatal): ${err.message}`);
+    }
+    this.log('Ready');
+  }
 
-      // Handle null response (API error case)
+  async onAdded() {
+    this.log('Added');
+  }
+
+  async onSettings({ oldSettings, newSettings, changedKeys }) {
+    this.log('Settings changed');
+    await this.__updateDevice();
+  }
+
+  async onRenamed(name) {
+    this.log(`Renamed to ${name}`);
+    await this.__updateDevice();
+  }
+
+  async onDeleted() {
+    this.log('Deleted');
+  }
+
+  /**
+   * Update device from pre-fetched zones data (no API call).
+   */
+  async __updateDeviceFromCache(zones) {
+    try {
       if (!zones) {
-        throw new Error('API returned null - zones unavailable');
+        throw new Error('No zones data');
       }
 
       const zone = zones.find(z => z.zone.id === this.zone_id && z.module_udid === this.module_udid);
 
-      // Handle zone not found
       if (!zone) {
-        throw new Error(`Zone ${this.zone_id} not found in API response`);
+        throw new Error(`Zone ${this.zone_id} not found`);
       }
 
-      // Success - reset failure count and ensure device is available
       this._failureCount = 0;
+      // Always ensure device is available after a successful update.
+      // This recovers from any prior setUnavailable() or transient errors.
       if (!this.getAvailable()) {
-        await this.setAvailable();
-        this.log('Device is now available again');
+        this.log('Recovering → available');
+      }
+      await this.setAvailable();
+
+      const newTarget = zone.zone.setTemperature / 10;
+      const newCurrent = zone.zone.currentTemperature / 10;
+      const oldTarget = await this.getCapabilityValue('target_temperature');
+      const oldCurrent = await this.getCapabilityValue('measure_temperature');
+
+      if (oldTarget !== newTarget || oldCurrent !== newCurrent) {
+        this.log(`${newCurrent}° (target: ${newTarget}°)${oldTarget !== newTarget ? ` [was ${oldTarget}°]` : ''}`);
+        this.homey.app.rlog(
+          `🌡️ ${this.getName()}: ${newCurrent}° (target: ${newTarget}°)` +
+          (oldTarget !== newTarget ? ` [was ${oldTarget}°]` : '')
+        );
       }
 
-      this.setCapabilityValueLogIfChanged('target_temperature', zone.zone.setTemperature / 10);
-      this.setCapabilityValueLogIfChanged('measure_temperature', zone.zone.currentTemperature / 10);
-      this.setCapabilityValueLogIfChanged('measure_battery', zone.zone.batteryLevel);
+      await this._setIfChanged('target_temperature', newTarget);
+      await this._setIfChanged('measure_temperature', newCurrent);
+      await this._setIfChanged('measure_battery', zone.zone.batteryLevel);
     } catch (err) {
       this._failureCount++;
-      this.error(`Error in __updateDevice (attempt ${this._failureCount}/${this._maxFailures}): ${err.message}`);
-
-      // Mark device unavailable after consecutive failures
-      if (this._failureCount >= this._maxFailures && this.getAvailable()) {
-        await this.setUnavailable('Connection lost - retrying...');
-        this.error('Device marked as unavailable due to repeated failures');
+      if (this._failureCount >= this._maxFailures) {
+        if (this.getAvailable()) {
+          await this.setUnavailable('Connection lost');
+          this.error(`Unavailable: ${err.message}`);
+        }
       }
     }
   }
 
-  async setCapabilityValueLog(capability, value) {
-    this.log(`setCapability in ${this.getName()}: ${capability}: ${value}`);
+  /**
+   * Update device by fetching zones from API.
+   */
+  async __updateDevice() {
     try {
-      await this.setCapabilityValue(capability, value);
+      const zones = await this.homey.app.getZones();
+
+      if (!zones) {
+        throw new Error('API returned null');
+      }
+
+      const zone = zones.find(z => z.zone.id === this.zone_id && z.module_udid === this.module_udid);
+
+      if (!zone) {
+        throw new Error(`Zone ${this.zone_id} not found`);
+      }
+
+      this._failureCount = 0;
+      if (!this.getAvailable()) {
+        this.log('Recovering → available');
+      }
+      await this.setAvailable();
+
+      await this._setIfChanged('target_temperature', zone.zone.setTemperature / 10);
+      await this._setIfChanged('measure_temperature', zone.zone.currentTemperature / 10);
+      await this._setIfChanged('measure_battery', zone.zone.batteryLevel);
     } catch (err) {
-      this.log(`setCapabilityValueLog error ${capability} ${err.message}`);
+      this._failureCount++;
+      if (this._failureCount >= this._maxFailures) {
+        if (this.getAvailable()) {
+          await this.setUnavailable('Connection lost');
+          this.error(`Unavailable: ${err.message}`);
+        }
+      }
     }
   }
 
-  async setCapabilityValueLogIfChanged(capability, value) {
-    const currentValue = await this.getCapabilityValue(capability);
-    if (currentValue !== value) {
-      this.log(`setCapability in ${this.getName()}: ${capability}: ${value} (was: ${currentValue})`);
-      try {
+  async _setIfChanged(capability, value) {
+    try {
+      const current = await this.getCapabilityValue(capability);
+      if (current !== value) {
         await this.setCapabilityValue(capability, value);
-      } catch (err) {
-        this.log(`setCapabilityValueLog error ${capability} ${err.message}`);
       }
+    } catch (err) {
+      this.error(`${capability}: ${err.message}`);
     }
   }
 

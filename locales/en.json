@@ -2,6 +2,6 @@
     "settings": {
       "title": "TECH Controllers app config",
       "subtitle": "Please provide your https://emodul.eu username and password. If it doesn't work - try changing your password.",
-      "cache-desc": "This is the minimum delay between subsequent eModul API calls to fetch zone data. Minimum is 60 seconds."
+      "cache-desc": "Minimum delay (in seconds) between eModul API polling calls. Minimum: 1s, recommended: 30s+. See https://emodul.eu/api for rate limits."
     }
   }
